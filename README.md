@@ -141,7 +141,58 @@ data/expenses.db        SQLite database (created on first run)
 `npm run tunnel` — expose the app on a temporary public `https://…trycloudflare.com`
 URL (for phone access when local Wi-Fi access is blocked).
 
-## Development notes
+## Deployment
+
+The app is a single Node.js service with a SQLite file database — deployable
+anywhere that supports Docker or Node with **persistent disk**.
+
+### Deploy to Railway (~2 minutes)
+
+1. Push this repo to GitHub (first time only):
+
+   ```bash
+   git init                          # already done
+   git commit -m "Expense tracker"   # already done
+   gh repo create expense-tracker --private --push   # needs GitHub CLI
+   # or: create an empty repo on github.com, then:
+   git remote add origin https://github.com/YOUR-USERNAME/expense-tracker.git
+   git push -u origin master
+   ```
+
+2. Go to [railway.com](https://railway.com) → **New Project** →
+   **Deploy from GitHub repo** → pick the repo. Railway auto-detects the
+   Dockerfile.
+
+3. Add persistent storage (important — this is where your data lives):
+   - In the service → **Storage** tab → **New Volume** → mount at **`/data`**
+   - (The Dockerfile sets `DATA_DIR=/data` already)
+
+4. Settings → **Networking** → **Generate Domain** → you get a permanent
+   `https://your-app.up.railway.app` URL. Open it on your phone →
+   **Add to Home screen**.
+
+5. Done. Every `git push` now redeploys automatically.
+
+**Cost:** the trial starts free (no card) with $5 credit / 30 days; this app
+uses roughly $2-3/month of usage. If it pauses when credit runs out, either
+add the $5/mo Hobby plan or move to a free-forever host (below).
+
+### Free-forever alternatives
+
+- **Oracle Cloud free tier** (always-free ARM VM, 4 core / 24GB RAM — generous;
+  needs a card for signup but is never charged) + this Dockerfile, with a
+  volume at `/data`
+- **Hetzner / Hostinger VPS** (~$3-5/mo) — full control, best long-term value:
+  `docker run -d -v ./data:/data -p 80:3000 ghcr.io/you/expense-tracker`
+- Not suitable: serverless hosts (Render free / Vercel / Fly free tier) —
+  they wipe the SQLite file between restarts since they lack persistent disks
+
+### Migrating your data to the deployed app
+
+Open the deployed app → Settings → **Restore backup** → upload the JSON backup
+you exported from your local instance (Settings → Full backup → Download JSON).
+
+
 
 - Regenerate icons after changing the design: `npm run icons`
 - Change the port: `PORT=8080 npm start` (or `set PORT=8080` on Windows)
