@@ -4,7 +4,7 @@
    App entry — router, theme, init
    ============================================================ */
 
-const VIEWS = ['dashboard', 'transactions', 'budgets', 'recurring', 'settings'];
+const VIEWS = ['dashboard', 'transactions', 'analytics', 'budgets', 'recurring', 'settings'];
 
 async function init() {
   try {
@@ -13,6 +13,7 @@ async function init() {
     State.categories = boot.categories;
     State.currencies = boot.currencies;
     State.methods = boot.methods;
+    if (boot.ai) State.ai = boot.ai;
     State.month = currentMonthKey();
   } catch (err) {
     $('#view').innerHTML = `
@@ -60,6 +61,7 @@ async function renderCurrent() {
   try {
     switch (State.view) {
       case 'transactions': await renderTransactions(); break;
+      case 'analytics': await renderAnalytics(); break;
       case 'budgets': await renderBudgets(); break;
       case 'recurring': await renderRecurring(); break;
       case 'settings': await renderSettings(); break;

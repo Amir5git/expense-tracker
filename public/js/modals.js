@@ -138,10 +138,12 @@ async function reloadCategories() {
    Transaction modal
    ============================================================ */
 
-function openTxModal(tx = null) {
-  let type = tx ? tx.type : 'expense';
-  let categoryId = tx ? tx.category_id : null;
-  let open = true;
+function openTxModal(tx = null, prefill = null) {
+  const base = tx || prefill || {};
+  let type = base.type || 'expense';
+  let categoryId = base.category_id || null;
+  let categoryTouched = !!base.category_id;   // don't auto-suggest over an explicit choice
+  const isNew = !tx;
 
   const body = () => `
     <div class="field">
@@ -153,28 +155,36 @@ function openTxModal(tx = null) {
     <div class="field">
       <label>Amount</label>
       <input class="input input-lg" data-role="tx-amount" type="number" inputmode="decimal" step="0.01" min="0"
-        placeholder="0.00" value="${tx ? esc(tx.amount) : ''}" autocomplete="off">
+        placeholder="0.00" value="${base.amount != null ? esc(base.amount) : ''}" autocomplete="off">
     </div>
     <div class="field">
       <label>Category</label>
       ${catGridHTML(type, categoryId)}
+      <div class="help-text" data-role="tx-suggest" style="display:none"></div>
     </div>
     <div class="field-row">
       <div class="field">
         <label>Date</label>
-        <input class="input" data-role="tx-date" type="date" value="${tx ? esc(tx.date) : todayStr()}">
+        <input class="input" data-role="tx-date" type="date" value="${base.date || todayStr()}">
       </div>
       <div class="field">
         <label>Payment method</label>
         <select class="input" data-role="tx-method">
-          ${METHODS.map(m => `<option value="${m.id}" ${tx && tx.method === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}
+          ${METHODS.map(m => `<option value="${m.id}" ${base.method === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}
         </select>
       </div>
     </div>
     <div class="field">
       <label>Note (optional)</label>
       <input class="input" data-role="tx-note" placeholder="e.g. Lunch with team" maxlength="500"
-        value="${tx ? esc(tx.note || '') : ''}" autocomplete="off">
+        value="${base.note ? esc(base.note) : ''}" autocomplete="off">
+      <div class="help-text">✨ The engine learns your notes — categories auto-fill over time.</div>
+    </div>
+    <div class="field">
+      <label>Tags (optional)</label>
+      <input class="input" data-role="tx-tags" placeholder="e.g. work, reimbursable" maxlength="120"
+        value="${base.tags ? esc(parseTags(base.tags).join(', ')) : ''}" autocomplete="off">
+      <div class="help-text">Comma separated. Filter by them later on the Transactions page.</div>
     </div>`;
 
   const close = openModal(modalShell(tx ? 'Edit transaction' : 'Add transaction', body(), tx ? '<button class="btn danger" data-del>Delete</button>' : ''), {
@@ -188,32 +198,57 @@ function openTxModal(tx = null) {
         m.querySelectorAll('[data-role="tx-type"] button').forEach(btn => {
           btn.addEventListener('click', () => {
             type = btn.dataset.seg;
-            if (catById(categoryId) && catById(categoryId).type !== type) categoryId = null;
+            if (catById(categoryId) && catById(categoryId).type !== type) { categoryId = null; categoryTouched = false; }
             rerender();
           });
         });
-        wireCatGrid(m, () => categoryId, v => { categoryId = v; });
+        wireCatGrid(m, () => categoryId, v => { categoryId = v; categoryTouched = true; });
       };
       wire(modal);
+
+      // smart auto-category: suggest as the note is typed (new entries only)
+      const noteInput = modal.querySelector('[data-role="tx-note"]');
+      noteInput.addEventListener('input', debounce(async () => {
+        if (!isNew || categoryTouched) return;
+        const note = noteInput.value.trim();
+        if (!note) return;
+        try {
+          const s = await api.post('/api/smart/suggest', { type, note, amount: Number(m2(modal, 'tx-amount').value) || undefined });
+          if (!s || !s.category_id) return;
+          const cat = catById(s.category_id);
+          if (!cat || cat.type !== type) return;
+          const hint = modal.querySelector('[data-role="tx-suggest"]');
+          if (categoryId !== s.category_id) {
+            categoryId = s.category_id;
+            modal.querySelectorAll('[data-role="cat-grid"] .cat-chip').forEach(c => {
+              c.classList.toggle('selected', Number(c.dataset.catId) === s.category_id);
+            });
+            if (hint) {
+              hint.style.display = '';
+              hint.textContent = `✨ Auto-filled ${cat.name} (${Math.round((s.confidence || 0.5) * 100)}% sure)`;
+            }
+          }
+        } catch { /* suggestion is best-effort */ }
+      }, 500));
 
       modal.querySelector('[data-ok]').addEventListener('click', async () => {
         const amount = Number(m2(modal, 'tx-amount').value);
         const date = m2(modal, 'tx-date').value;
         const method = m2(modal, 'tx-method').value;
         const note = m2(modal, 'tx-note').value.trim();
+        const tags = m2(modal, 'tx-tags').value;
 
         if (!amount || amount <= 0) return showToast('Enter an amount greater than zero', 'error');
         if (!categoryId) return showToast('Pick a category', 'error');
         if (!date) return showToast('Pick a date', 'error');
 
-        const payload = { type, amount, category_id: categoryId, date, note, method };
+        const payload = { type, amount, category_id: categoryId, date, note, method, tags };
         try {
           modal.querySelector('[data-ok]').disabled = true;
           if (tx) await api.put(`/api/transactions/${tx.id}`, payload);
           else await api.post('/api/transactions', payload);
           showToast(tx ? 'Transaction updated' : `${type === 'income' ? 'Income' : 'Expense'} added`);
           closeModal(true);
-          open = false;
           refreshView();
         } catch (err) {
           modal.querySelector('[data-ok]').disabled = false;
@@ -233,7 +268,7 @@ function openTxModal(tx = null) {
         } catch (err) { showToast(err.message, 'error'); }
       });
     },
-    onClose() { open = false; },
+    onClose() { close && undefined; },
   });
   return close;
 }
@@ -378,9 +413,10 @@ function openBudgetModal(budget = null) {
    Recurring modal
    ============================================================ */
 
-function openRecurringModal(rule = null) {
-  let type = rule ? rule.type : 'expense';
-  let categoryId = rule ? rule.category_id : null;
+function openRecurringModal(rule = null, prefill = null) {
+  const base = rule || prefill || {};
+  let type = base.type || 'expense';
+  let categoryId = base.category_id || null;
 
   const body = () => `
     <div class="field">
@@ -393,12 +429,12 @@ function openRecurringModal(rule = null) {
       <div class="field">
         <label>Amount</label>
         <input class="input" data-role="rec-amount" type="number" inputmode="decimal" step="0.01" min="0"
-          placeholder="0.00" value="${rule ? esc(rule.amount) : ''}" autocomplete="off">
+          placeholder="0.00" value="${base.amount != null ? esc(base.amount) : ''}" autocomplete="off">
       </div>
       <div class="field">
         <label>Repeats</label>
         <select class="input" data-role="rec-freq">
-          ${FREQUENCIES.map(f => `<option value="${f.id}" ${rule && rule.frequency === f.id ? 'selected' : ''}>${f.label}</option>`).join('')}
+          ${FREQUENCIES.map(f => `<option value="${f.id}" ${base.frequency === f.id ? 'selected' : ''}>${f.label}</option>`).join('')}
         </select>
       </div>
     </div>
@@ -409,20 +445,20 @@ function openRecurringModal(rule = null) {
     <div class="field-row">
       <div class="field">
         <label>Next date</label>
-        <input class="input" data-role="rec-next" type="date" min="${todayStr()}" value="${rule ? esc(rule.next_date) : todayStr()}">
+        <input class="input" data-role="rec-next" type="date" min="${todayStr()}" value="${base.next_date || todayStr()}">
         <div class="help-text">The rule posts on this date and every cycle after.</div>
       </div>
       <div class="field">
         <label>Payment method</label>
         <select class="input" data-role="rec-method">
-          ${METHODS.map(m => `<option value="${m.id}" ${rule && rule.method === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}
+          ${METHODS.map(m => `<option value="${m.id}" ${base.method === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}
         </select>
       </div>
     </div>
     <div class="field">
       <label>Note (optional)</label>
       <input class="input" data-role="rec-note" maxlength="500" placeholder="e.g. Netflix subscription"
-        value="${rule ? esc(rule.note || '') : ''}" autocomplete="off">
+        value="${base.note ? esc(base.note) : ''}" autocomplete="off">
     </div>
     <div class="field flex" style="gap:12px">
       <button type="button" class="toggle ${rule && rule.active ? 'on' : !rule ? 'on' : ''}" data-role="rec-active" aria-label="Active"></button>

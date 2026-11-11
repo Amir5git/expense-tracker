@@ -21,12 +21,13 @@ const State = {
   categories: [],
   currencies: [],
   methods: [],
+  ai: { configured: false, provider: 'none', model: '' },
   view: 'dashboard',
   month: null,          // 'YYYY-MM'
   dashboard: null,      // last summary payload
   budgetsCache: null,
   tx: {
-    filters: { type: '', category: '', range: 'month', from: '', to: '', q: '', sort: 'date_desc' },
+    filters: { type: '', category: '', range: 'month', from: '', to: '', q: '', tag: '', sort: 'date_desc' },
     rows: [], total: 0, income: 0, expense: 0, loading: false, loadedAll: false,
   },
 };
@@ -151,6 +152,17 @@ function catsOf(type) {
 }
 function catById(id) {
   return State.categories.find(c => c.id === Number(id));
+}
+
+/* ---------- tags ---------- */
+
+function parseTags(csv) {
+  return String(csv || '').split(',').filter(Boolean);
+}
+function tagChipsHTML(csv) {
+  const tags = parseTags(csv);
+  if (!tags.length) return '';
+  return `<span class="tag-row">${tags.map(t => `<span class="tag-chip">#${esc(t)}</span>`).join('')}</span>`;
 }
 
 /* ---------- misc ---------- */

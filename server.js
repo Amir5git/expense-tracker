@@ -79,6 +79,11 @@ CREATE TABLE IF NOT EXISTS budgets (
 );
 `);
 
+/* ---- migrations ---- */
+if (!db.prepare('PRAGMA table_info(transactions)').all().some(c => c.name === 'tags')) {
+  db.exec("ALTER TABLE transactions ADD COLUMN tags TEXT NOT NULL DEFAULT ''");
+}
+
 /* ------------------------------------------------------------------ */
 /* Constants                                                           */
 /* ------------------------------------------------------------------ */
@@ -238,6 +243,19 @@ function escapeLike(s) { return String(s).replace(/[\\%_]/g, c => '\\' + c); }
 })();
 
 /* ------------------------------------------------------------------ */
+/* Smart engine + AI layer                                             */
+/* ------------------------------------------------------------------ */
+
+const Smart = require('./smart')({
+  db, monthRange, currentMonthKey, addMonthsKey, todayStr,
+  currencySymbol: () => (CURRENCIES.find(c => c.code === getSetting('currency', 'INR')) || { symbol: '₹' }).symbol,
+});
+
+const AI = require('./ai')({
+  db, getSetting, setSetting, todayStr, monthRange, addMonthsKey, currentMonthKey,
+});
+
+/* ------------------------------------------------------------------ */
 /* Recurring engine                                                    */
 /* ------------------------------------------------------------------ */
 
@@ -314,16 +332,24 @@ api.get('/bootstrap', (req, res) => {
     categories: db.prepare('SELECT * FROM categories ORDER BY type, name').all(),
     methods: METHODS,
     currencies: CURRENCIES,
+    ai: AI.status(),
   });
 });
 
 /* ---- settings ---- */
 api.get('/settings', (req, res) => {
-  res.json({ currency: getSetting('currency', 'INR'), theme: getSetting('theme', 'system') });
+  res.json({
+    currency: getSetting('currency', 'INR'),
+    theme: getSetting('theme', 'system'),
+    ai_provider: getSetting('ai_provider', 'none'),
+    ai_model: getSetting('ai_model', ''),
+    ai_base_url: getSetting('ai_base_url', ''),
+    ai_has_key: !!getSetting('ai_key', ''),
+  });
 });
 
 api.put('/settings', (req, res) => {
-  const { currency, theme } = req.body || {};
+  const { currency, theme, ai_provider, ai_key, ai_model, ai_base_url } = req.body || {};
   if (currency !== undefined) {
     if (!CURRENCIES.some(c => c.code === currency)) return res.status(400).json({ error: 'Unsupported currency' });
     setSetting('currency', currency);
@@ -332,13 +358,29 @@ api.put('/settings', (req, res) => {
     if (!['system', 'light', 'dark'].includes(theme)) return res.status(400).json({ error: 'Invalid theme' });
     setSetting('theme', theme);
   }
-  res.json({ currency: getSetting('currency', 'INR'), theme: getSetting('theme', 'system') });
+  if (ai_provider !== undefined) {
+    if (!['none', 'groq', 'gemini', 'openrouter', 'custom'].includes(ai_provider)) return res.status(400).json({ error: 'Invalid AI provider' });
+    setSetting('ai_provider', ai_provider);
+  }
+  if (ai_key !== undefined && typeof ai_key === 'string' && ai_key.length > 0 && ai_key.length < 500) {
+    setSetting('ai_key', ai_key.trim());
+  }
+  if (ai_model !== undefined && typeof ai_model === 'string') setSetting('ai_model', ai_model.trim().slice(0, 120));
+  if (ai_base_url !== undefined && typeof ai_base_url === 'string') setSetting('ai_base_url', ai_base_url.trim().slice(0, 300));
+  res.json({
+    currency: getSetting('currency', 'INR'),
+    theme: getSetting('theme', 'system'),
+    ai_provider: getSetting('ai_provider', 'none'),
+    ai_model: getSetting('ai_model', ''),
+    ai_base_url: getSetting('ai_base_url', ''),
+    ai_has_key: !!getSetting('ai_key', ''),
+  });
 });
 
 /* ---- transactions ---- */
 api.get('/transactions', (req, res) => {
   processRecurring();
-  const { type, category, from, to, q, sort } = req.query;
+  const { type, category, from, to, q, tag, sort } = req.query;
 
   const where = [];
   const params = [];
@@ -346,6 +388,10 @@ api.get('/transactions', (req, res) => {
   if (category && Number.isInteger(Number(category))) { where.push('t.category_id = ?'); params.push(Number(category)); }
   if (validDate(from)) { where.push('t.date >= ?'); params.push(from); }
   if (validDate(to)) { where.push('t.date <= ?'); params.push(to); }
+  if (tag && String(tag).trim()) {
+    where.push("(',' || t.tags || ',' LIKE ?)");
+    params.push('%,' + String(tag).trim().toLowerCase() + ',%');
+  }
   if (q && String(q).trim()) {
     const like = `%${escapeLike(String(q).trim())}%`;
     where.push("(t.note LIKE ? ESCAPE '\\' OR c.name LIKE ? ESCAPE '\\')");
@@ -419,16 +465,28 @@ function validateTxBody(body, { partial = false, existing = null } = {}) {
     if (typeof note !== 'string' || note.length > 500) return { error: 'Note must be 500 characters or fewer' };
     out.note = note.trim();
   }
+  if (!partial || b.tags !== undefined) {
+    let tags = b.tags ?? existing?.tags ?? '';
+    if (Array.isArray(tags)) tags = tags.join(',');
+    if (typeof tags !== 'string') return { error: 'Invalid tags' };
+    const list = tags.split(',')
+      .map(t => t.trim().toLowerCase())
+      .filter(Boolean)
+      .slice(0, 10)
+      .map(t => t.slice(0, 24));
+    out.tags = [...new Set(list)].join(',');
+  }
   return { value: out };
 }
 
 api.post('/transactions', (req, res) => {
   const v = validateTxBody(req.body);
   if (v.error) return res.status(400).json({ error: v.error });
-  const { type, amount, category_id, date, note, method } = v.value;
+  const { type, amount, category_id, date, note, method, tags } = v.value;
   const info = db.prepare(`
-    INSERT INTO transactions (type, amount, category_id, date, note, method)
-    VALUES (?, ?, ?, ?, ?, ?)`).run(type, amount, category_id, date, note, method);
+    INSERT INTO transactions (type, amount, category_id, date, note, method, tags)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`).run(type, amount, category_id, date, note, method, tags || '');
+  Smart.invalidatePatterns();
   res.status(201).json(txRow(info.lastInsertRowid));
 });
 
@@ -440,14 +498,16 @@ api.put('/transactions/:id', (req, res) => {
   if (v.error) return res.status(400).json({ error: v.error });
   const next = { ...existing, ...v.value };
   db.prepare(`
-    UPDATE transactions SET type = ?, amount = ?, category_id = ?, date = ?, note = ?, method = ?
-    WHERE id = ?`).run(next.type, next.amount, next.category_id, next.date, next.note, next.method, id);
+    UPDATE transactions SET type = ?, amount = ?, category_id = ?, date = ?, note = ?, method = ?, tags = ?
+    WHERE id = ?`).run(next.type, next.amount, next.category_id, next.date, next.note, next.method, next.tags || '', id);
+  Smart.invalidatePatterns();
   res.json(txRow(id));
 });
 
 api.delete('/transactions/:id', (req, res) => {
   const info = db.prepare('DELETE FROM transactions WHERE id = ?').run(Number(req.params.id));
   if (info.changes === 0) return res.status(404).json({ error: 'Transaction not found' });
+  Smart.invalidatePatterns();
   res.json({ ok: true });
 });
 
@@ -685,14 +745,8 @@ api.get('/summary', (req, res) => {
 
   const budgets = budgetsWithSpent(month);
 
-  // project month-end spend (only meaningful for the current month)
-  let projected = null;
-  if (month === currentMonthKey()) {
-    const dayOfMonth = Number(todayStr().slice(8, 10));
-    if (dayOfMonth > 0 && monthTotals.expense > 0) {
-      projected = Math.round((monthTotals.expense / dayOfMonth) * days * 100) / 100;
-    }
-  }
+  // project month-end spend using weekday-aware forecasting (current month only)
+  const projected = month === currentMonthKey() ? Smart.weekdayForecast(month) : null;
 
   const recent = db.prepare(`
     SELECT t.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color
@@ -705,6 +759,73 @@ api.get('/summary', (req, res) => {
     byCategory, daily, trend, budgets, projected, recent,
     savingsRate: monthTotals.income > 0 ? (monthTotals.income - monthTotals.expense) / monthTotals.income : null,
   });
+});
+
+/* ---- tags ---- */
+api.get('/tags', (req, res) => {
+  const rows = db.prepare("SELECT tags FROM transactions WHERE tags != ''").all();
+  const set = new Set();
+  for (const r of rows) for (const t of r.tags.split(',')) if (t.trim()) set.add(t.trim());
+  res.json([...set].sort());
+});
+
+/* ---- smart engine ---- */
+api.get('/smart/insights', (req, res) => {
+  processRecurring();
+  const month = validMonthKeyOrCurrent(req.query.month);
+  res.json({ month, insights: Smart.insights(month) });
+});
+
+api.post('/smart/suggest', (req, res) => {
+  const { type, note, amount } = req.body || {};
+  res.json(Smart.suggest({ type, note, amount }));
+});
+
+api.get('/smart/subscriptions', (req, res) => {
+  res.json(Smart.detectSubscriptions());
+});
+
+api.get('/smart/budget-suggestions', (req, res) => {
+  const month = validMonthKeyOrCurrent(req.query.month);
+  res.json(Smart.budgetSuggestions(month));
+});
+
+api.get('/analytics', (req, res) => {
+  processRecurring();
+  const month = validMonthKeyOrCurrent(req.query.month);
+  res.json(Smart.analytics(month));
+});
+
+/* ---- AI (bring-your-own-key LLM) ---- */
+api.get('/ai/status', (req, res) => res.json(AI.status()));
+
+api.post('/ai/ask', async (req, res) => {
+  const { question, month } = req.body || {};
+  if (!question || !String(question).trim()) return res.status(400).json({ error: 'Ask a question first' });
+  const m = validMonth(month) ? month : currentMonthKey();
+  try {
+    res.json(await AI.ask(String(question).trim(), m));
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+api.post('/ai/parse', async (req, res) => {
+  const { text } = req.body || {};
+  if (!text || !String(text).trim()) return res.status(400).json({ error: 'Enter some text first' });
+  try {
+    res.json(await AI.parse(String(text).trim()));
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
+api.post('/ai/test', async (req, res) => {
+  try {
+    res.json(await AI.test());
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
 });
 
 /* ---- export / import / maintenance ---- */
@@ -725,16 +846,16 @@ api.get('/export', (req, res) => {
   const format = req.query.format === 'csv' ? 'csv' : 'json';
   if (format === 'csv') {
     const rows = db.prepare(`
-      SELECT t.id, t.date, t.type, c.name AS category, t.amount, t.method, t.note, t.recurring_id
+      SELECT t.id, t.date, t.type, c.name AS category, t.amount, t.method, t.note, t.recurring_id, t.tags
       FROM transactions t JOIN categories c ON c.id = t.category_id
       ORDER BY t.date DESC, t.id DESC`).all();
-    const header = ['id', 'date', 'type', 'category', 'amount', 'method', 'note', 'recurring_id'];
+    const header = ['id', 'date', 'type', 'category', 'amount', 'method', 'note', 'recurring_id', 'tags'];
     const escCsv = v => {
       const s = v === null || v === undefined ? '' : String(v);
       return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
     };
     const lines = [header.join(',')];
-    for (const r of rows) lines.push([r.id, r.date, r.type, r.category, r.amount, r.method, r.note, r.recurring_id ?? ''].map(escCsv).join(','));
+    for (const r of rows) lines.push([r.id, r.date, r.type, r.category, r.amount, r.method, r.note, r.recurring_id ?? '', r.tags ?? ''].map(escCsv).join(','));
     const csv = '\uFEFF' + lines.join('\r\n');
     res.setHeader('Content-Type', 'text/csv; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="expenses-${todayStr()}.csv"`);
@@ -768,11 +889,14 @@ api.post('/import', (req, res) => {
       insCat.run(Number(c.id), String(c.name).slice(0, 40), c.type, String(c.icon || '📦').slice(0, 8),
         /^#[0-9a-fA-F]{6}$/.test(String(c.color)) ? c.color : '#6C5CE7', c.is_default ? 1 : 0);
     }
-    const insTx = db.prepare('INSERT INTO transactions (id, type, amount, category_id, date, note, method, recurring_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)');
+    const insTx = db.prepare('INSERT INTO transactions (id, type, amount, category_id, date, note, method, recurring_id, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)');
     for (const t of data.transactions) {
+      const tags = String(t.tags || '').split(',')
+        .map(x => x.trim().toLowerCase()).filter(Boolean).slice(0, 10).map(x => x.slice(0, 24));
       insTx.run(Number(t.id), t.type, Number(t.amount), Number(t.category_id), t.date,
         String(t.note || '').slice(0, 500), METHODS.some(m => m.id === t.method) ? t.method : 'cash',
-        t.recurring_id != null && Number.isInteger(Number(t.recurring_id)) ? Number(t.recurring_id) : null);
+        t.recurring_id != null && Number.isInteger(Number(t.recurring_id)) ? Number(t.recurring_id) : null,
+        [...new Set(tags)].join(','));
     }
     if (Array.isArray(data.budgets)) {
       const insB = db.prepare('INSERT INTO budgets (id, category_id, amount) VALUES (?, ?, ?)');
@@ -796,6 +920,7 @@ api.post('/import', (req, res) => {
       if (['system', 'light', 'dark'].includes(data.settings.theme)) setSetting('theme', data.settings.theme);
     }
     db.exec('COMMIT');
+    Smart.invalidatePatterns();
   } catch (err) {
     db.exec('ROLLBACK');
     return res.status(400).json({ error: 'Import failed: ' + err.message });
@@ -810,7 +935,7 @@ api.post('/sample-data', (req, res) => {
   const rnd = (min, max) => Math.round((min + Math.random() * (max - min)) * 100) / 100;
   const pick = arr => arr[Math.floor(Math.random() * arr.length)];
   const cat = name => db.prepare('SELECT id FROM categories WHERE name = ?').get(name)?.id;
-  const ins = db.prepare('INSERT INTO transactions (type, amount, category_id, date, note, method) VALUES (?, ?, ?, ?, ?, ?)');
+  const ins = db.prepare('INSERT INTO transactions (type, amount, category_id, date, note, method, tags) VALUES (?, ?, ?, ?, ?, ?, ?)');
 
   const today = new Date();
   const notes = {
@@ -823,6 +948,15 @@ api.post('/sample-data', (req, res) => {
     'Subscriptions': ['Netflix', 'Spotify', 'YouTube Premium'],
     'Personal Care': ['Haircut', 'Skincare'],
   };
+  // occasional tag pools to showcase tag analytics
+  const tagPools = {
+    'Food & Dining': ['work,office', 'friends', 'family', 'weekend'],
+    'Transport': ['commute', 'office'],
+    'Shopping': ['wants', 'gift'],
+    'Entertainment': ['weekend', 'friends'],
+    'Health': ['health'],
+    'Groceries': ['household'],
+  };
 
   db.exec('BEGIN');
   try {
@@ -831,30 +965,30 @@ api.post('/sample-data', (req, res) => {
       const ds = fmtDate(d);
       const dow = d.getDay();
       // salary on the 1st of each month
-      if (d.getDate() === 1) ins.run('income', rnd(62000, 68000), cat('Salary'), ds, 'Monthly salary', 'netbanking');
+      if (d.getDate() === 1) ins.run('income', rnd(62000, 68000), cat('Salary'), ds, 'Monthly salary', 'netbanking', '');
       // freelance occasionally
-      if (d.getDate() === 15 && Math.random() < 0.5) ins.run('income', rnd(3000, 15000), cat('Freelance'), ds, 'Side project', 'upi');
+      if (d.getDate() === 15 && Math.random() < 0.5) ins.run('income', rnd(3000, 15000), cat('Freelance'), ds, 'Side project', 'upi', 'side-hustle');
       // rent on the 3rd
-      if (d.getDate() === 3) ins.run('expense', 16000, cat('Rent'), ds, 'Rent', 'netbanking');
+      if (d.getDate() === 3) ins.run('expense', 16000, cat('Rent'), ds, 'Rent', 'netbanking', 'household');
       // utilities on the 10th
-      if (d.getDate() === 10) ins.run('expense', rnd(1800, 4200), cat('Utilities'), ds, 'Electricity & internet', 'upi');
+      if (d.getDate() === 10) ins.run('expense', rnd(1800, 4200), cat('Utilities'), ds, 'Electricity & internet', 'upi', 'household,bills');
       // subscriptions on the 5th
       if (d.getDate() === 5) {
-        ins.run('expense', 649, cat('Subscriptions'), ds, 'Netflix', 'card');
-        ins.run('expense', 119, cat('Subscriptions'), ds, 'Spotify', 'card');
+        ins.run('expense', 649, cat('Subscriptions'), ds, 'Netflix', 'card', 'subscriptions,shared');
+        ins.run('expense', 119, cat('Subscriptions'), ds, 'Spotify', 'card', 'subscriptions');
       }
       // groceries about twice a week
       if (dow === 0 || dow === 3 || (dow === 5 && Math.random() < 0.5)) {
-        ins.run('expense', rnd(700, 2600), cat('Groceries'), ds, pick(notes['Groceries']), 'upi');
+        ins.run('expense', rnd(700, 2600), cat('Groceries'), ds, pick(notes['Groceries']), 'upi', pick(tagPools['Groceries']));
       }
       // food & dining most days
-      if (Math.random() < 0.75) ins.run('expense', rnd(90, 750), cat('Food & Dining'), ds, pick(notes['Food & Dining']), pick(['upi', 'cash', 'card']));
+      if (Math.random() < 0.75) ins.run('expense', rnd(90, 750), cat('Food & Dining'), ds, pick(notes['Food & Dining']), pick(['upi', 'cash', 'card']), Math.random() < 0.35 ? pick(tagPools['Food & Dining']) : '');
       // transport most weekdays
-      if (dow >= 1 && dow <= 5 && Math.random() < 0.8) ins.run('expense', rnd(30, 220), cat('Transport'), ds, pick(notes['Transport']), pick(['upi', 'cash']));
+      if (dow >= 1 && dow <= 5 && Math.random() < 0.8) ins.run('expense', rnd(30, 220), cat('Transport'), ds, pick(notes['Transport']), pick(['upi', 'cash']), Math.random() < 0.3 ? pick(tagPools['Transport']) : '');
       // shopping / entertainment / health occasionally
-      if (Math.random() < 0.12) ins.run('expense', rnd(300, 3200), cat('Shopping'), ds, pick(notes['Shopping']), 'card');
-      if (Math.random() < 0.10) ins.run('expense', rnd(200, 1100), cat('Entertainment'), ds, pick(notes['Entertainment']), 'upi');
-      if (Math.random() < 0.05) ins.run('expense', rnd(200, 1500), cat('Health'), ds, pick(notes['Health']), 'upi');
+      if (Math.random() < 0.12) ins.run('expense', rnd(300, 3200), cat('Shopping'), ds, pick(notes['Shopping']), 'card', Math.random() < 0.4 ? pick(tagPools['Shopping']) : '');
+      if (Math.random() < 0.10) ins.run('expense', rnd(200, 1100), cat('Entertainment'), ds, pick(notes['Entertainment']), 'upi', Math.random() < 0.5 ? pick(tagPools['Entertainment']) : '');
+      if (Math.random() < 0.05) ins.run('expense', rnd(200, 1500), cat('Health'), ds, pick(notes['Health']), 'upi', pick(tagPools['Health']));
     }
 
     // a couple of budgets to showcase the feature
@@ -872,6 +1006,7 @@ api.post('/sample-data', (req, res) => {
     if (cat('Rent')) insR.run('expense', 16000, cat('Rent'), 'Rent', 'netbanking', 'monthly', next3rd);
 
     db.exec('COMMIT');
+    Smart.invalidatePatterns();
   } catch (err) {
     db.exec('ROLLBACK');
     throw err;
@@ -882,6 +1017,7 @@ api.post('/sample-data', (req, res) => {
 api.delete('/data', (req, res) => {
   if (req.query.confirm !== 'DELETE') return res.status(400).json({ error: 'Pass ?confirm=DELETE to confirm' });
   db.exec('DELETE FROM transactions; DELETE FROM budgets; DELETE FROM recurring;');
+  Smart.invalidatePatterns();
   res.json({ ok: true });
 });
 
