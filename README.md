@@ -9,8 +9,9 @@ insights, subscription detection, budget suggestions, weekday-aware forecasts)
 and an optional **AI assistant** — chat with your data and add transactions by
 typing plain English, using a free-tier LLM key of your choice.
 
-Built with **Node.js + Express + SQLite** on the back end and a fast,
-dependency-free web app on the front end.
+Runs on **Node.js (Hono + SQLite)** for local/LAN use and on **Cloudflare
+Workers + D1** when deployed — the same shared codebase (`app.js`) serves
+both runtimes. The front end is a fast, dependency-free web app.
 
 ---
 
@@ -27,6 +28,10 @@ npm start
 Then open **http://localhost:3000** in your browser.
 
 The database is created automatically at `data/expenses.db`.
+
+> To develop against Cloudflare's actual runtime instead: `npm run dev:cf`
+> (workerd + simulated D1 on port 8787). See **Deployment** below for the
+> free Cloudflare hosting setup.
 
 ### Use it on your phone (Android/iOS)
 
@@ -143,9 +148,13 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 ## Project structure
 
 ```
-server.js               Express app + SQLite schema + API
+server.js               Node.js entry — Hono app + static files (npm start)
+worker.js                Cloudflare Workers entry — D1 binding (npm run deploy)
+app.js                   Shared backend — all API routes, schema, recurring engine
+db.js                   Database adapters: node:sqlite ↔ Cloudflare D1
 smart.js                Smart Engine (suggestions, insights, analytics)
 ai.js                   AI layer (BYO-key provider proxy)
+wrangler.toml            Cloudflare deploy config (D1 binding + static assets)
 public/
   index.html            App shell
   manifest.json         PWA manifest
@@ -159,7 +168,7 @@ public/
     views.js            Dashboard/transactions/analytics/budgets/recurring/settings
     app.js              Router, theme, keyboard shortcuts, init
 scripts/gen-icons.js    Regenerates PWA icons (npm run icons)
-data/expenses.db        SQLite database (created on first run)
+data/expenses.db        SQLite database (Node mode, created on first run)
 ```
 
 ## API overview
@@ -183,7 +192,7 @@ data/expenses.db        SQLite database (created on first run)
 | POST | `/api/ai/ask` | Chat with your data (needs key) |
 | POST | `/api/ai/parse` | Sentence → prefilled transaction (needs key) |
 | POST | `/api/ai/test` | Test the AI connection (needs key) |
-| GET | `/api/health` | Health check (for Railway/uptime monitors) |
+| GET | `/api/health` | Health check (for uptime monitors) |
 | GET | `/api/export?format=json\|csv` | Backup / CSV export |
 | POST | `/api/import` | Restore backup |
 | POST | `/api/sample-data` | Load demo data (only when empty) |
@@ -217,56 +226,100 @@ the browser. All AI calls are proxied server-side with a 45s timeout.
 
 ## Deployment
 
-The app is a single Node.js service with a SQLite file database — deployable
-anywhere that supports Docker or Node with **persistent disk**.
+One codebase, two runtimes:
 
-### Deploy to Railway (~2 minutes)
+| Mode | Command | Entry point | Storage | Best for |
+|---|---|---|---|---|
+| Local | `npm start` | `server.js` (Node.js) | SQLite file `data/expenses.db` | your computer + phone on same Wi-Fi |
+| Cloudflare | `npm run deploy` | `worker.js` (Workers) | Cloudflare D1 | free 24/7 hosting, installable PWA |
 
-1. Push this repo to GitHub (first time only):
+### Deploy to Cloudflare (~5 minutes, free, no card)
+
+The Workers free plan gives you **100,000 API requests/day**, **unlimited
+static asset requests** (the frontend never hits the Worker), and **D1** —
+Cloudflare's SQLite — with 5M row reads + 100k row writes/day. That's far
+more than a personal tracker will ever use, free forever, with no cold
+starts.
+
+1. **Log in** (opens your browser once to authorize):
 
    ```bash
-   git init                          # already done
-   git commit -m "Expense tracker"   # already done
-   gh repo create expense-tracker --private --push   # needs GitHub CLI
-   # or: create an empty repo on github.com, then:
-   git remote add origin https://github.com/YOUR-USERNAME/expense-tracker.git
-   git push -u origin master
+   npx wrangler login
    ```
 
-2. Go to [railway.com](https://railway.com) → **New Project** →
-   **Deploy from GitHub repo** → pick the repo. Railway auto-detects the
-   Dockerfile.
+2. **Create the D1 database** (one time):
 
-3. Add persistent storage (important — this is where your data lives):
-   - In the service → **Storage** tab → **New Volume** → mount at **`/data`**
-   - (The Dockerfile sets `DATA_DIR=/data` already)
+   ```bash
+   npx wrangler d1 create expense-tracker
+   ```
 
-4. Settings → **Networking** → **Generate Domain** → you get a permanent
-   `https://your-app.up.railway.app` URL. Open it on your phone →
-   **Add to Home screen**.
+   Copy the printed `database_id` (a UUID).
 
-5. Done. Every `git push` now redeploys automatically.
+3. **Paste it into `wrangler.toml`**, replacing the placeholder value
+   `00000000-0000-4000-8000-000000000000`.
 
-**Cost:** the trial starts free (no card) with $5 credit / 30 days; this app
-uses roughly $2-3/month of usage. If it pauses when credit runs out, either
-add the $5/mo Hobby plan or move to a free-forever host (below).
+4. **Deploy**:
 
-### Free-forever alternatives
+   ```bash
+   npm run deploy
+   ```
 
-- **Oracle Cloud free tier** (always-free ARM VM, 4 core / 24GB RAM — generous;
-  needs a card for signup but is never charged) + this Dockerfile, with a
-  volume at `/data`
-- **Hetzner / Hostinger VPS** (~$3-5/mo) — full control, best long-term value:
-  `docker run -d -v ./data:/data -p 80:3000 ghcr.io/you/expense-tracker`
-- Not suitable: serverless hosts (Render free / Vercel / Fly free tier) —
-  they wipe the SQLite file between restarts since they lack persistent disks
+   The schema and default categories are created automatically on the first
+   request — no migration step needed.
+
+5. Open the printed `https://expense-tracker.<your-subdomain>.workers.dev`
+   URL. On your phone: browser menu → **Add to Home screen** → the app
+   installs as a full-screen PWA, exactly like the local version.
+
+Notes on the Cloudflare deployment:
+
+- **Free plan daily limits** (all far above a single user's needs): 100k
+  Worker requests, 5M D1 row reads, 100k D1 row writes, 5 GB storage total.
+- **Restoring data**: export a JSON backup from your local instance
+  (Settings → Full backup) and restore it in the deployed app's Settings.
+  Imports are automatically chunked to respect D1's per-invocation query
+  limit on the free plan.
+- **Timezone**: Workers run in UTC, so "today" flips at 05:30 IST —
+  recurring catch-up posting and forecasts use UTC day boundaries.
+- `npm run dev:cf` runs the *same* code locally on workerd (Cloudflare's
+  actual runtime) with a simulated D1 in `.wrangler/` — useful to verify the
+  deploy path before deploying. Re-run `npm run deploy` to update the live
+  app; there is no build step.
+
+### Alternative: any Node/Docker host (Railway, VPS…)
+
+`server.js` is a normal Node service with a SQLite file database — deployable
+anywhere that supports Docker or Node with a **persistent disk**:
+
+- **Railway** (~2 min): push the repo to GitHub → new project → deploy from
+  repo (Dockerfile auto-detected) → add a volume mounted at `/data` (the
+  Dockerfile sets `DATA_DIR=/data`) → generate a domain. The $5 trial credit
+  covers roughly two months of this app.
+- **Oracle Cloud free tier** (always-free ARM VM, 4 core / 24GB RAM —
+  generous; needs a card for signup but is never charged) + this Dockerfile,
+  with a volume at `/data`
+- **Hetzner / Hostinger VPS** (~$3-5/mo) — full control, best long-term
+  value: `docker run -d -v ./data:/data -p 80:3000 ghcr.io/you/expense-tracker`
+- Not suitable: serverless Node hosts (Render free / Vercel / Fly free tier)
+  — they wipe the SQLite file between restarts since they lack persistent
+  disks
 
 ### Migrating your data to the deployed app
 
 Open the deployed app → Settings → **Restore backup** → upload the JSON backup
 you exported from your local instance (Settings → Full backup → Download JSON).
 
+## Tips
 
+- All npm scripts:
+
+  | Command | What it does |
+  |---|---|
+  | `npm start` / `npm run dev` | Run locally on Node.js (port 3000) |
+  | `npm run dev:cf` | Run locally on Cloudflare's workerd runtime (port 8787) |
+  | `npm run deploy` | Deploy to Cloudflare Workers + D1 |
+  | `npm run tunnel` | Temporary public HTTPS URL for the local server |
+  | `npm run icons` | Regenerate PWA icons |
 
 - Regenerate icons after changing the design: `npm run icons`
 - Change the port: `PORT=8080 npm start` (or `set PORT=8080` on Windows)

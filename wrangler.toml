@@ -1,0 +1,22 @@
+# Cloudflare Workers + D1 deployment config.
+#
+# One-time setup (see README → "Deploy to Cloudflare"):
+#   npx wrangler login
+#   npx wrangler d1 create expense-tracker
+#   → copy the printed database_id below
+#
+# Then:  npm run deploy
+
+name = "expense-tracker"
+main = "worker.js"
+compatibility_date = "2026-10-01"
+
+# Static frontend — served by Cloudflare's global CDN (free, unlimited).
+[assets]
+directory = "./public"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "expense-tracker"
+# Replace with the id printed by `npx wrangler d1 create expense-tracker`:
+database_id = "00000000-0000-4000-8000-000000000000"

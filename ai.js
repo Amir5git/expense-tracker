@@ -10,7 +10,8 @@
  *  - Custom      (any OpenAI-compatible endpoint, incl. local Ollama)
  *
  * The key is stored server-side; the browser never sees it. All calls are
- * proxied through this module.
+ * proxied through this module (works on Node.js and Cloudflare Workers —
+ * both have fetch, AbortController and timers).
  */
 
 module.exports = function createAI(ctx) {
@@ -47,25 +48,25 @@ module.exports = function createAI(ctx) {
     },
   };
 
-  function config() {
-    const provider = getSetting('ai_provider', 'none');
+  async function config() {
+    const provider = await getSetting('ai_provider', 'none');
     if (provider === 'none' || !PROVIDERS[provider]) return null;
-    const key = getSetting('ai_key', '');
+    const key = await getSetting('ai_key', '');
     if (!key) return null;
-    const model = getSetting('ai_model', '') || PROVIDERS[provider].defaultModel;
-    const baseUrl = provider === 'custom' ? getSetting('ai_base_url', '') : PROVIDERS[provider].url;
+    const model = (await getSetting('ai_model', '')) || PROVIDERS[provider].defaultModel;
+    const baseUrl = provider === 'custom' ? (await getSetting('ai_base_url', '')) : PROVIDERS[provider].url;
     if (!baseUrl || !model) return null;
     return { provider, key, model, baseUrl };
   }
 
-  function status() {
-    const provider = getSetting('ai_provider', 'none');
-    const c = config();
+  async function status() {
+    const provider = await getSetting('ai_provider', 'none');
+    const c = await config();
     return {
       configured: !!c,
       provider,
       providerLabel: PROVIDERS[provider] ? PROVIDERS[provider].label : 'None',
-      model: c ? c.model : (getSetting('ai_model', '') || (PROVIDERS[provider] ? PROVIDERS[provider].defaultModel : '')),
+      model: c ? c.model : ((await getSetting('ai_model', '')) || (PROVIDERS[provider] ? PROVIDERS[provider].defaultModel : '')),
       providers: Object.entries(PROVIDERS).map(([id, p]) => ({
         id, label: p.label, defaultModel: p.defaultModel, keyUrl: p.keyUrl, note: p.note,
       })),
@@ -75,7 +76,7 @@ module.exports = function createAI(ctx) {
   /* ---------------- provider call ---------------- */
 
   async function chatComplete(messages, { json = false, maxTokens = 800, temperature = 0.3 } = {}) {
-    const c = config();
+    const c = await config();
     if (!c) throw new Error('AI is not configured — add a provider and API key in Settings.');
 
     const body = {
@@ -142,46 +143,46 @@ module.exports = function createAI(ctx) {
 
   /* ---------------- data digest ---------------- */
 
-  function buildDigest(month) {
-    const settingsCurrency = getSetting('currency', 'INR');
+  async function buildDigest(month) {
+    const settingsCurrency = await getSetting('currency', 'INR');
     const { start, end } = ctx.monthRange(month);
     const histStart = ctx.addMonthsKey(month, -5) + '-01';
 
-    const monthTotals = db.prepare(`
+    const monthTotals = await db.get(`
       SELECT COALESCE(SUM(CASE WHEN type='income' THEN amount END),0) AS income,
              COALESCE(SUM(CASE WHEN type='expense' THEN amount END),0) AS expense
-      FROM transactions WHERE date >= ? AND date <= ?`).get(start, end);
+      FROM transactions WHERE date >= ? AND date <= ?`, [start, end]);
 
-    const trend = db.prepare(`
+    const trend = await db.all(`
       SELECT substr(date,1,7) AS ym,
              COALESCE(SUM(CASE WHEN type='income' THEN amount END),0) AS income,
              COALESCE(SUM(CASE WHEN type='expense' THEN amount END),0) AS expense
-      FROM transactions WHERE date >= ? GROUP BY ym ORDER BY ym`).all(histStart);
+      FROM transactions WHERE date >= ? GROUP BY ym ORDER BY ym`, [histStart]);
 
-    const byCategory = db.prepare(`
+    const byCategory = await db.all(`
       SELECT c.name, SUM(t.amount) AS total, COUNT(*) AS n
       FROM transactions t JOIN categories c ON c.id = t.category_id
       WHERE t.type='expense' AND t.date >= ? AND t.date <= ?
-      GROUP BY c.name ORDER BY total DESC LIMIT 10`).all(start, end);
+      GROUP BY c.name ORDER BY total DESC LIMIT 10`, [start, end]);
 
-    const budgets = db.prepare(`
+    const budgets = await db.all(`
       SELECT c.name, b.amount,
              COALESCE((SELECT SUM(t.amount) FROM transactions t
                        WHERE t.category_id=b.category_id AND t.type='expense'
                          AND t.date >= ? AND t.date <= ?),0) AS spent
-      FROM budgets b JOIN categories c ON c.id = b.category_id ORDER BY c.name`).all(start, end);
+      FROM budgets b JOIN categories c ON c.id = b.category_id ORDER BY c.name`, [start, end]);
 
-    const recent = db.prepare(`
+    const recent = await db.all(`
       SELECT t.date, t.type, t.amount, c.name AS category, t.note, t.method
       FROM transactions t JOIN categories c ON c.id = t.category_id
-      ORDER BY t.date DESC, t.id DESC LIMIT 25`).all();
+      ORDER BY t.date DESC, t.id DESC LIMIT 25`);
 
-    const topMerchants = db.prepare(`
+    const topMerchants = await db.all(`
       SELECT note, SUM(amount) AS total, COUNT(*) AS n
       FROM transactions WHERE type='expense' AND date >= ? AND date <= ?
-      GROUP BY note ORDER BY total DESC LIMIT 8`).all(start, end);
+      GROUP BY note ORDER BY total DESC LIMIT 8`, [start, end]);
 
-    const txCount = db.prepare('SELECT COUNT(*) AS c FROM transactions').get().c;
+    const txCount = (await db.get('SELECT COUNT(*) AS c FROM transactions')).c;
 
     return {
       currency: settingsCurrency,
@@ -202,7 +203,7 @@ module.exports = function createAI(ctx) {
   /* ---------------- ask (chat with your data) ---------------- */
 
   async function ask(question, month) {
-    const digest = buildDigest(month || todayStr().slice(0, 7));
+    const digest = await buildDigest(month || todayStr().slice(0, 7));
     const system = `You are a concise personal finance assistant inside a self-hosted expense tracker.
 You are given the user's real financial data as JSON. Answer their question using ONLY this data.
 Rules:
@@ -225,10 +226,10 @@ ${JSON.stringify(digest)}`;
   /* ---------------- parse (natural language → transaction) ---------------- */
 
   async function parse(text) {
-    const cats = db.prepare('SELECT name, type FROM categories ORDER BY type, name').all();
+    const cats = await db.all('SELECT name, type FROM categories ORDER BY type, name');
     const categoryList = cats.map(c => c.name).join('", "');
     const system = `You convert natural language into a personal finance transaction.
-Today's date is ${todayStr()}. The user's currency is ${getSetting('currency', 'INR')}.
+Today's date is ${todayStr()}. The user's currency is ${await getSetting('currency', 'INR')}.
 Valid expense categories: choose from ["${cats.filter(c => c.type === 'expense').map(c => c.name).join('", "')}", ...]
 Valid income categories: choose from ["${cats.filter(c => c.type === 'income').map(c => c.name).join('", "')}", ...]
 Payment methods: Cash, UPI, Card, Net Banking, Wallet, Other.
@@ -264,12 +265,13 @@ If the text is not describing a transaction, respond: {"error":"not a transactio
     const amount = Number(parsed.amount);
     if (!isFinite(amount) || amount <= 0) return { error: 'Could not find a valid amount in that text.' };
 
-    const catRow = db.prepare('SELECT id, name, type FROM categories WHERE lower(name) = ? AND type = ?')
-      .get(String(parsed.category || '').toLowerCase(), type);
+    const catRow = await db.get('SELECT id, name, type FROM categories WHERE lower(name) = ? AND type = ?',
+      [String(parsed.category || '').toLowerCase(), type]);
     let category_id = catRow ? catRow.id : null;
     let category_name = catRow ? catRow.name : null;
     if (!category_id) {
-      const fallback = db.prepare('SELECT id, name FROM categories WHERE type = ? AND (name = ? OR is_default = 1)').get(type, type === 'expense' ? 'Others' : 'Other Income');
+      const fallback = await db.get('SELECT id, name FROM categories WHERE type = ? AND (name = ? OR is_default = 1)',
+        [type, type === 'expense' ? 'Others' : 'Other Income']);
       category_id = fallback.id; category_name = fallback.name;
     }
 
@@ -295,7 +297,8 @@ If the text is not describing a transaction, respond: {"error":"not a transactio
     const reply = await chatComplete([
       { role: 'user', content: 'Reply with exactly: OK' },
     ], { temperature: 0, maxTokens: 10 });
-    return { ok: true, ms: Date.now() - t0, model: config().model, reply: reply.trim().slice(0, 40) };
+    const c = await config();
+    return { ok: true, ms: Date.now() - t0, model: c.model, reply: reply.trim().slice(0, 40) };
   }
 
   return { status, ask, parse, test, PROVIDERS };

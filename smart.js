@@ -12,15 +12,17 @@
  *  - analytics aggregates (heatmap, weekday patterns, merchants, methods)
  *
  * No API keys, no cloud, no cost. That's the point.
+ *
+ * All database calls go through the async adapter (db.js) so this module
+ * runs identically on Node.js and Cloudflare Workers.
  */
 
 module.exports = function createSmart(ctx) {
   const { db, monthRange, currentMonthKey, addMonthsKey, todayStr, currencySymbol } = ctx;
 
-  /** money prefix for human-readable insight text */
-  function money(n) {
-    const sym = currencySymbol ? currencySymbol() : '₹';
-    return `${sym}${Math.round(Number(n) || 0)}`;
+  /** money formatter for human-readable insight text (uses the active currency) */
+  function mkMoney(sym) {
+    return n => `${sym}${Math.round(Number(n) || 0)}`;
   }
 
   /* ---------------- text normalization ---------------- */
@@ -64,8 +66,8 @@ module.exports = function createSmart(ctx) {
     },
   };
 
-  function categoryIdByName(name, type) {
-    const row = db.prepare('SELECT id FROM categories WHERE lower(name) = ? AND type = ?').get(String(name).toLowerCase(), type);
+  async function categoryIdByName(name, type) {
+    const row = await db.get('SELECT id FROM categories WHERE lower(name) = ? AND type = ?', [String(name).toLowerCase(), type]);
     return row ? row.id : null;
   }
 
@@ -74,11 +76,11 @@ module.exports = function createSmart(ctx) {
   let patternCache = { at: 0, byType: null };
   const PATTERN_TTL = 60 * 1000;
 
-  function learnedPatterns() {
+  async function learnedPatterns() {
     if (patternCache.byType && Date.now() - patternCache.at < PATTERN_TTL) return patternCache.byType;
-    const rows = db.prepare(`
+    const rows = await db.all(`
       SELECT note, type, category_id, method, amount FROM transactions
-      ORDER BY id DESC LIMIT 800`).all();
+      ORDER BY id DESC LIMIT 800`);
     const byType = { expense: [], income: [] };
     for (const r of rows) {
       const tk = tokens(r.note);
@@ -95,13 +97,13 @@ module.exports = function createSmart(ctx) {
    * Suggest a category + payment method for a new transaction.
    * Returns { category_id, method, confidence, source } or null.
    */
-  function suggest({ type, note, amount }) {
+  async function suggest({ type, note, amount }) {
     if (type !== 'income' && type !== 'expense') return null;
     const text = String(note || '');
     if (!tokens(text).length) return null;
 
     // 1) exact learned note match ("swiggy order" seen before)
-    const learned = learnedPatterns()[type];
+    const learned = (await learnedPatterns())[type];
     const key = normKey(text);
     const exact = learned.filter(p => p.key === key);
     if (exact.length) {
@@ -135,7 +137,7 @@ module.exports = function createSmart(ctx) {
     for (const [catName, words] of Object.entries(hints)) {
       const hit = words.some(w => n.includes(w));
       if (hit) {
-        const id = categoryIdByName(catName, type);
+        const id = await categoryIdByName(catName, type);
         if (id && (!bestHint || words.length > bestHint.words)) bestHint = { id, words: words.length, name: catName };
       }
     }
@@ -146,18 +148,18 @@ module.exports = function createSmart(ctx) {
 
   /* ---------------- core data loading ---------------- */
 
-  function loadWindow(month, backMonths) {
+  async function loadWindow(month, backMonths) {
     const start = addMonthsKey(month, -backMonths) + '-01';
     const { start: mStart, end: mEnd } = monthRange(month);
-    const rows = db.prepare(`
+    const rows = await db.all(`
       SELECT date, type, amount, category_id, note, method, recurring_id
-      FROM transactions WHERE date >= ? AND date <= ?`).all(start, mEnd);
+      FROM transactions WHERE date >= ? AND date <= ?`, [start, mEnd]);
     return { rows, start };
   }
 
-  function catMap() {
+  async function catMap() {
     const m = {};
-    for (const c of db.prepare('SELECT id, name, icon, color, type FROM categories').all()) m[c.id] = c;
+    for (const c of await db.all('SELECT id, name, icon, color, type FROM categories')) m[c.id] = c;
     return m;
   }
 
@@ -168,9 +170,12 @@ module.exports = function createSmart(ctx) {
 
   /* ---------------- insights feed ---------------- */
 
-  function insights(month) {
-    const { rows } = loadWindow(month, 3);
-    const cats = catMap();
+  async function insights(month) {
+    const sym = currencySymbol ? await currencySymbol() : '₹';
+    const money = mkMoney(sym);
+
+    const { rows } = await loadWindow(month, 3);
+    const cats = await catMap();
     const yms = [-3, -2, -1, 0].map(i => addMonthsKey(month, i));
 
     const perCat = {};                 // catId → { ym: expense }
@@ -242,9 +247,8 @@ module.exports = function createSmart(ctx) {
     }
 
     /* budget pacing */
-    const { start: mStart, end: mEnd } = monthRange(month);
-    const budgets = db.prepare(`
-      SELECT b.category_id, b.amount, c.name, c.icon FROM budgets b JOIN categories c ON c.id = b.category_id`).all();
+    const budgets = await db.all(`
+      SELECT b.category_id, b.amount, c.name, c.icon FROM budgets b JOIN categories c ON c.id = b.category_id`);
     const isCurrentMonth = month === currentMonthKey();
     for (const b of budgets) {
       const spent = perCat[b.category_id] ? (perCat[b.category_id][month] || 0) : 0;
@@ -269,7 +273,7 @@ module.exports = function createSmart(ctx) {
     }
 
     /* subscriptions found in the wild */
-    for (const s of detectSubscriptions().slice(0, 2)) {
+    for (const s of (await detectSubscriptions()).slice(0, 2)) {
       out.push({
         id: `sub-${s.key}`,
         severity: 'info',
@@ -284,7 +288,7 @@ module.exports = function createSmart(ctx) {
     }
 
     /* budget suggestions for unbudgeted active categories */
-    for (const s of budgetSuggestions(month).slice(0, 2)) {
+    for (const s of (await budgetSuggestions(month)).slice(0, 2)) {
       out.push({
         id: `sug-${s.category_id}`,
         severity: 'info',
@@ -337,7 +341,7 @@ module.exports = function createSmart(ctx) {
     }
 
     /* weekday pattern */
-    const wAvg = weekdayAverages(month);
+    const wAvg = await weekdayAverages(month);
     if (wAvg) {
       const weekend = (wAvg[0] + wAvg[6]) / 2;   // Sun + Sat
       const weekday = (wAvg[1] + wAvg[2] + wAvg[3] + wAvg[4] + wAvg[5]) / 5;
@@ -351,7 +355,7 @@ module.exports = function createSmart(ctx) {
     }
 
     /* no-spend streak */
-    const st = streaks();
+    const st = await streaks();
     if (st.current >= 2) {
       out.push({
         id: 'streak', severity: 'good', icon: '🔥',
@@ -384,13 +388,13 @@ module.exports = function createSmart(ctx) {
 
   /* ---------------- subscription detection ---------------- */
 
-  function detectSubscriptions() {
+  async function detectSubscriptions() {
     const since = new Date();
     since.setDate(since.getDate() - 120);
     const sinceStr = `${since.getFullYear()}-${String(since.getMonth() + 1).padStart(2, '0')}-${String(since.getDate()).padStart(2, '0')}`;
-    const rows = db.prepare(`
+    const rows = await db.all(`
       SELECT date, amount, category_id, note, recurring_id FROM transactions
-      WHERE type = 'expense' AND date >= ? ORDER BY date`).all(sinceStr);
+      WHERE type = 'expense' AND date >= ? ORDER BY date`, [sinceStr]);
 
     const groups = new Map();
     for (const r of rows) {
@@ -401,7 +405,7 @@ module.exports = function createSmart(ctx) {
       groups.get(k1).push(r);
     }
 
-    const rules = db.prepare('SELECT category_id, amount FROM recurring').all();
+    const rules = await db.all('SELECT category_id, amount FROM recurring');
     const out = [];
     for (const [key, list] of groups) {
       if (list.length < 3) continue;
@@ -448,8 +452,8 @@ module.exports = function createSmart(ctx) {
 
   /* ---------------- budget suggestions ---------------- */
 
-  function budgetSuggestions(month) {
-    const { rows } = loadWindow(month, 5);
+  async function budgetSuggestions(month) {
+    const { rows } = await loadWindow(month, 5);
     const perCat = {};
     for (const r of rows) {
       if (r.type !== 'expense') continue;
@@ -458,8 +462,8 @@ module.exports = function createSmart(ctx) {
       perCat[r.category_id] = perCat[r.category_id] || {};
       perCat[r.category_id][ym] = (perCat[r.category_id][ym] || 0) + r.amount;
     }
-    const budgeted = new Set(db.prepare('SELECT category_id FROM budgets').all().map(b => b.category_id));
-    const cats = catMap();
+    const budgeted = new Set((await db.all('SELECT category_id FROM budgets')).map(b => b.category_id));
+    const cats = await catMap();
     const out = [];
     for (const [catId, byYm] of Object.entries(perCat)) {
       if (budgeted.has(Number(catId))) continue;
@@ -479,13 +483,12 @@ module.exports = function createSmart(ctx) {
 
   /* ---------------- weekday forecasting ---------------- */
 
-  function weekdayAverages(month) {
-    const { rows } = loadWindow(month, 3);
+  async function weekdayAverages(month) {
+    const { rows } = await loadWindow(month, 3);
     const sums = Array(7).fill(0);
     const counts = Array(7).fill(0);
     for (const r of rows) {
       if (r.type !== 'expense') continue;
-      const ym = r.date.slice(0, 7);
       const w = weekdayOf(r.date);
       sums[w] += r.amount;
       counts[w]++;
@@ -494,16 +497,16 @@ module.exports = function createSmart(ctx) {
     return sums.map((s, i) => (counts[i] >= 2 ? s / counts[i] : (counts[i] === 1 ? s : 0)));
   }
 
-  function weekdayForecast(month) {
+  async function weekdayForecast(month) {
     if (month !== currentMonthKey()) return null;
-    const avgs = weekdayAverages(month);
+    const avgs = await weekdayAverages(month);
     const { end } = monthRange(month);
     const today = todayStr();
     let projected = 0;
     let spentSoFar = 0;
     // spend so far this month
-    const rows = db.prepare(`SELECT amount FROM transactions WHERE type='expense' AND date >= ? AND date <= ?`)
-      .all(month + '-01', today);
+    const rows = await db.all(`SELECT amount FROM transactions WHERE type='expense' AND date >= ? AND date <= ?`,
+      [month + '-01', today]);
     for (const r of rows) spentSoFar += r.amount;
 
     let d = parse(today);
@@ -518,11 +521,11 @@ module.exports = function createSmart(ctx) {
 
   /* ---------------- streaks ---------------- */
 
-  function streaks() {
-    const first = db.prepare('SELECT MIN(date) AS d FROM transactions').get().d;
+  async function streaks() {
+    const first = (await db.get('SELECT MIN(date) AS d FROM transactions')).d;
     if (!first) return { current: 0, best: 0 };
     const today = parse(todayStr());
-    const daily = new Set(db.prepare(`SELECT date FROM transactions WHERE type='expense' AND amount > 0`).all().map(r => r.date));
+    const daily = new Set((await db.all(`SELECT date FROM transactions WHERE type='expense' AND amount > 0`)).map(r => r.date));
 
     // current: consecutive no-spend days ending today (today counts if nothing spent yet)
     let current = 0;
@@ -550,12 +553,12 @@ module.exports = function createSmart(ctx) {
 
   /* ---------------- analytics aggregates ---------------- */
 
-  function analytics(month) {
+  async function analytics(month) {
     const { start, end, days } = monthRange(month);
-    const rows = db.prepare(`
+    const rows = await db.all(`
       SELECT date, type, amount, category_id, note, method, tags FROM transactions
-      WHERE date >= ? AND date <= ? ORDER BY date`).all(start, end);
-    const cats = catMap();
+      WHERE date >= ? AND date <= ? ORDER BY date`, [start, end]);
+    const cats = await catMap();
 
     const daily = {};                 // date → {expense, income}
     const merchants = {};             // normKey → {total, count, sample, icon}
@@ -592,9 +595,9 @@ module.exports = function createSmart(ctx) {
 
     // 6-month category trend for top categories
     const trendStart = addMonthsKey(month, -5);
-    const trendRows = db.prepare(`
+    const trendRows = await db.all(`
       SELECT date, amount, category_id FROM transactions
-      WHERE type='expense' AND date >= ? AND date <= ?`).all(trendStart + '-01', end);
+      WHERE type='expense' AND date >= ? AND date <= ?`, [trendStart + '-01', end]);
     const trendPerCat = {};
     for (const r of trendRows) {
       const ym = r.date.slice(0, 7);
@@ -614,7 +617,7 @@ module.exports = function createSmart(ctx) {
     return {
       month, income, expense,
       calendar,
-      weekdayAverages: weekdayAverages(month),
+      weekdayAverages: await weekdayAverages(month),
       weekdayTotals: (() => {
         const sums = Array(7).fill(0);
         for (const r of rows) if (r.type === 'expense') sums[weekdayOf(r.date)] += r.amount;
@@ -626,7 +629,7 @@ module.exports = function createSmart(ctx) {
       methods: Object.entries(methods)
         .map(([m, v]) => ({ method: m, ...v }))
         .sort((a, b) => b.total - a.total),
-      streaks: streaks(),
+      streaks: await streaks(),
       noSpendDays: days - Object.values(daily).filter(d => d.expense > 0).length,
       activeDays: Object.keys(daily).length,
       trend: { months: yms, rows: trend },
