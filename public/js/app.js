@@ -40,6 +40,7 @@ async function init() {
   $('#fab').addEventListener('click', () => openTxModal());
   $('#sideThemeBtn').addEventListener('click', toggleTheme);
   $('#topThemeBtn').addEventListener('click', toggleTheme);
+  setupBottomNav();
   document.addEventListener('keydown', onKeydown);
 
   route();
@@ -57,6 +58,7 @@ function route() {
   State.view = next;
   document.body.dataset.view = next;
   $$('[data-nav]').forEach(a => a.classList.toggle('active', a.dataset.nav === State.view));
+  positionNavLiquid();
   renderCurrent();
   if (changed) window.scrollTo({ top: 0, behavior: 'smooth' });
 }
@@ -91,6 +93,64 @@ function animateView(view) {
   view.classList.remove('view-enter');
   void view.offsetWidth;
   view.classList.add('view-enter');
+}
+
+/* ---------- liquid bottom navigation ---------- */
+
+let navResizeRaf = 0;
+
+function setupBottomNav() {
+  const nav = $('#bottomnav');
+  if (!nav) return;
+  nav.addEventListener('pointerdown', onNavPointerDown);
+  window.addEventListener('resize', () => {
+    cancelAnimationFrame(navResizeRaf);
+    navResizeRaf = requestAnimationFrame(() => positionNavLiquid({ instant: true }));
+  });
+}
+
+/* Slide the liquid pill so it sits under the active tab. */
+function positionNavLiquid({ instant = false } = {}) {
+  const nav = $('#bottomnav');
+  const liquid = nav && nav.querySelector('.nav-liquid');
+  if (!liquid) return;
+
+  if (getComputedStyle(nav).display === 'none') return;
+
+  const active = nav.querySelector('a.active');
+  const rect = active && active.getBoundingClientRect();
+  if (!active || !rect || !rect.width) {
+    nav.classList.remove('liquid-ready');
+    return;
+  }
+
+  const navRect = nav.getBoundingClientRect();
+  const center = rect.left - navRect.left + rect.width / 2;
+
+  if (instant) liquid.classList.add('no-anim');
+  liquid.style.setProperty('--nav-x', `${center}px`);
+  if (instant) {
+    void liquid.offsetWidth;
+    requestAnimationFrame(() => liquid.classList.remove('no-anim'));
+  }
+
+  // Fade in only after the first position is applied, so it doesn't slide in on load.
+  requestAnimationFrame(() => nav.classList.add('liquid-ready'));
+}
+
+/* A soft ripple that spreads from the finger within the tapped tab. */
+function onNavPointerDown(e) {
+  const link = e.target.closest('#bottomnav a');
+  if (!link) return;
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+
+  const rect = link.getBoundingClientRect();
+  const ripple = document.createElement('span');
+  ripple.className = 'nav-ripple';
+  ripple.style.left = `${e.clientX - rect.left}px`;
+  ripple.style.top = `${e.clientY - rect.top}px`;
+  ripple.addEventListener('animationend', () => ripple.remove());
+  link.appendChild(ripple);
 }
 
 function refreshView() { renderCurrent(); }

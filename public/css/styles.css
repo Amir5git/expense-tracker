@@ -58,7 +58,7 @@
 
 * { box-sizing: border-box; }
 
-html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; scroll-padding-top: 76px; }
 
 body {
   margin: 0;
@@ -69,7 +69,10 @@ body {
   line-height: 1.45;
   min-height: 100vh;
   min-height: 100dvh;
+  -webkit-overflow-scrolling: touch;
 }
+
+.modal-body, .cat-grid, .ai-chat { scroll-behavior: smooth; -webkit-overflow-scrolling: touch; }
 
 button, input, select, textarea { font: inherit; color: inherit; }
 button { cursor: pointer; }
@@ -256,6 +259,7 @@ body[data-view="settings"] .topbar-nav[data-nav="settings"] { display: none; }
 }
 #bottomnav a {
   position: relative;
+  z-index: 1;
   flex: 1;
   display: flex;
   flex-direction: column;
@@ -266,26 +270,85 @@ body[data-view="settings"] .topbar-nav[data-nav="settings"] { display: none; }
   font-size: 10px;
   font-weight: 600;
   min-width: 0;
+  overflow: hidden;
   transition: color 0.18s var(--ease);
 }
-#bottomnav a::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  left: 50%;
-  width: 0;
-  height: 3px;
-  border-radius: 0 0 999px 999px;
-  background: var(--primary);
-  transform: translateX(-50%);
-  transition: width 0.22s var(--ease);
+#bottomnav a > span:not(.nav-ripple) {
+  position: relative;
+  z-index: 1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
-#bottomnav a span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
-#bottomnav a svg { width: 21px; height: 21px; transition: transform 0.22s var(--ease); }
+#bottomnav a > svg { position: relative; z-index: 1; width: 21px; height: 21px; transition: transform 0.22s var(--ease); }
 #bottomnav a:active svg { transform: scale(0.9); }
 #bottomnav a.active { color: var(--primary); }
-#bottomnav a.active svg { transform: translateY(-2px) scale(1.06); }
-#bottomnav a.active::after { width: 26px; }
+#bottomnav a.active svg { transform: translateY(-2px) scale(1.06); animation: navIconPop 0.45s var(--ease); }
+
+/* liquid pill that flows between tabs */
+.nav-liquid {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 46px;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 0.28s var(--ease);
+  --nav-x: 0px;
+}
+#bottomnav.liquid-ready .nav-liquid { opacity: 1; }
+.nav-blob {
+  position: absolute;
+  top: 4px;
+  left: 0;
+  width: 46px;
+  height: 36px;
+  border-radius: 999px;
+  transform: translateX(var(--nav-x)) translateX(-50%);
+  will-change: transform;
+}
+.nav-blob.main {
+  background: color-mix(in srgb, var(--primary) 18%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 22%, transparent);
+  transition: transform 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.nav-blob.trail {
+  top: 8px;
+  width: 34px;
+  height: 28px;
+  background: color-mix(in srgb, var(--primary) 32%, transparent);
+  filter: blur(8px);
+  opacity: 0.55;
+  transition: transform 0.62s cubic-bezier(0.22, 1, 0.36, 1);
+}
+.nav-liquid.no-anim .nav-blob { transition: none !important; }
+
+/* liquid tap ripple */
+.nav-ripple {
+  position: absolute;
+  z-index: 0;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: radial-gradient(circle,
+    color-mix(in srgb, var(--primary) 42%, transparent) 0%,
+    color-mix(in srgb, var(--primary) 16%, transparent) 55%,
+    transparent 72%);
+  transform: translate(-50%, -50%) scale(0);
+  animation: navRipple 0.62s cubic-bezier(0.2, 0.7, 0.3, 1) forwards;
+  pointer-events: none;
+}
+@keyframes navRipple {
+  0% { transform: translate(-50%, -50%) scale(0); opacity: 0.9; }
+  100% { transform: translate(-50%, -50%) scale(10); opacity: 0; }
+}
+@keyframes navIconPop {
+  0% { transform: translateY(0) scale(1); }
+  55% { transform: translateY(-3px) scale(1.12); }
+  100% { transform: translateY(-2px) scale(1.06); }
+}
 
 /* FAB */
 #fab {

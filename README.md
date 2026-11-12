@@ -171,7 +171,8 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 **Platform**
 - Responsive: sidebar on desktop; 5-item bottom navigation + FAB on mobile,
   with Accounts and Settings shortcuts in the top-right
-- Smooth, reduced-motion-aware animations and pill-shaped controls
+- Smooth, reduced-motion-aware animations, a liquid bottom-nav indicator,
+  tap ripples, and pill-shaped controls
 - Installable PWA with offline app shell (data needs the server)
 - Keyboard shortcuts: `N` new transaction, `/` search
 - Mobile bottom-sheet modals, desktop dialogs
