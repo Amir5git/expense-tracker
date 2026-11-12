@@ -267,7 +267,7 @@ body[data-view="settings"] .topbar-nav[data-nav="settings"] { display: none; }
   justify-content: center;
   gap: 3px;
   color: var(--muted);
-  font-size: 10px;
+  font-size: 11px;
   font-weight: 600;
   min-width: 0;
   overflow: hidden;
@@ -284,44 +284,52 @@ body[data-view="settings"] .topbar-nav[data-nav="settings"] { display: none; }
 #bottomnav a > svg { position: relative; z-index: 1; width: 21px; height: 21px; transition: transform 0.22s var(--ease); }
 #bottomnav a:active svg { transform: scale(0.9); }
 #bottomnav a.active { color: var(--primary); }
-#bottomnav a.active svg { transform: translateY(-2px) scale(1.06); animation: navIconPop 0.45s var(--ease); }
+[data-theme="light"] #bottomnav a.active { color: color-mix(in srgb, var(--primary) 76%, #000); }
+[data-theme="dark"] #bottomnav a.active { color: var(--primary-2); }
+#bottomnav a.active svg { transform: scale(1.04); }
 
-/* liquid pill that flows between tabs */
+/* liquid capsule that wraps the active tab's icon + label */
 .nav-liquid {
   position: absolute;
   top: 0;
   left: 0;
   right: 0;
-  height: 46px;
+  height: var(--bottomnav-h);
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.28s var(--ease);
   --nav-x: 0px;
+  --nav-w: 68px;
 }
 #bottomnav.liquid-ready .nav-liquid { opacity: 1; }
 .nav-blob {
   position: absolute;
-  top: 4px;
+  top: 5px;
   left: 0;
-  width: 46px;
-  height: 36px;
+  width: var(--nav-w);
+  height: 52px;
   border-radius: 999px;
   transform: translateX(var(--nav-x)) translateX(-50%);
-  will-change: transform;
+  will-change: transform, width;
 }
 .nav-blob.main {
-  background: color-mix(in srgb, var(--primary) 18%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--primary) 22%, transparent);
-  transition: transform 0.5s cubic-bezier(0.34, 1.56, 0.64, 1);
+  background: color-mix(in srgb, var(--primary) 18%, var(--surface));
+  border: 1px solid color-mix(in srgb, var(--primary) 30%, transparent);
+  box-shadow:
+    0 4px 16px color-mix(in srgb, var(--primary) 20%, transparent),
+    inset 0 1px 0 rgba(255, 255, 255, 0.3);
+  transition: transform 0.46s cubic-bezier(0.34, 1.4, 0.64, 1), width 0.3s var(--ease);
+}
+[data-theme="dark"] .nav-blob.main {
+  box-shadow:
+    0 6px 18px rgba(0, 0, 0, 0.35),
+    inset 0 1px 0 rgba(255, 255, 255, 0.07);
 }
 .nav-blob.trail {
-  top: 0;
-  width: 58px;
-  height: 44px;
-  background: color-mix(in srgb, var(--primary) 30%, transparent);
-  filter: blur(10px);
-  opacity: 0.5;
-  transition: transform 0.66s cubic-bezier(0.22, 1, 0.36, 1);
+  background: color-mix(in srgb, var(--primary) 55%, transparent);
+  filter: blur(18px);
+  opacity: 0.22;
+  transition: transform 0.62s cubic-bezier(0.22, 1, 0.36, 1), width 0.3s var(--ease);
 }
 .nav-liquid.no-anim .nav-blob { transition: none !important; }
 
@@ -343,11 +351,6 @@ body[data-view="settings"] .topbar-nav[data-nav="settings"] { display: none; }
 @keyframes navRipple {
   0% { transform: translate(-50%, -50%) scale(0); opacity: 0.9; }
   100% { transform: translate(-50%, -50%) scale(10); opacity: 0; }
-}
-@keyframes navIconPop {
-  0% { transform: translateY(0) scale(1); }
-  55% { transform: translateY(-3px) scale(1.12); }
-  100% { transform: translateY(-2px) scale(1.06); }
 }
 
 /* FAB */

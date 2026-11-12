@@ -126,9 +126,11 @@ function positionNavLiquid({ instant = false } = {}) {
 
   const navRect = nav.getBoundingClientRect();
   const center = rect.left - navRect.left + rect.width / 2;
+  const width = Math.max(52, rect.width - 10);
 
   if (instant) liquid.classList.add('no-anim');
   liquid.style.setProperty('--nav-x', `${center}px`);
+  liquid.style.setProperty('--nav-w', `${width}px`);
   if (instant) {
     void liquid.offsetWidth;
     requestAnimationFrame(() => liquid.classList.remove('no-anim'));
