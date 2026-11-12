@@ -52,9 +52,13 @@ async function init() {
 
 function route() {
   const name = (location.hash || '#/dashboard').replace(/^#\//, '') || 'dashboard';
-  State.view = VIEWS.includes(name) ? name : 'dashboard';
+  const next = VIEWS.includes(name) ? name : 'dashboard';
+  const changed = next !== State.view;
+  State.view = next;
+  document.body.dataset.view = next;
   $$('[data-nav]').forEach(a => a.classList.toggle('active', a.dataset.nav === State.view));
   renderCurrent();
+  if (changed) window.scrollTo({ top: 0, behavior: 'smooth' });
 }
 
 async function renderCurrent() {
@@ -79,6 +83,14 @@ async function renderCurrent() {
         <button class="btn" onclick="location.reload()">Reload</button>
       </div>`;
   }
+  animateView(view);
+}
+
+/* Re-trigger the enter animation after the view content is replaced. */
+function animateView(view) {
+  view.classList.remove('view-enter');
+  void view.offsetWidth;
+  view.classList.add('view-enter');
 }
 
 function refreshView() { renderCurrent(); }

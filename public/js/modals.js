@@ -6,6 +6,10 @@
 
 const modalStack = [];
 
+function prefersReducedMotion() {
+  return window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+}
+
 /**
  * Opens a modal. html should contain a .modal element.
  * Returns a close(result) function.
@@ -17,12 +21,24 @@ function openModal(html, { onMount, onClose } = {}) {
 
   const entry = {
     overlay,
+    closed: false,
     close(result) {
+      if (entry.closed) return;
+      entry.closed = true;
       const i = modalStack.indexOf(entry);
       if (i >= 0) modalStack.splice(i, 1);
-      overlay.remove();
-      document.body.style.overflow = '';
-      if (onClose) onClose(result);
+      if (!modalStack.length) document.body.style.overflow = '';
+
+      const finish = () => {
+        overlay.remove();
+        if (onClose) onClose(result);
+      };
+      if (prefersReducedMotion()) {
+        finish();
+      } else {
+        overlay.classList.add('closing');
+        setTimeout(finish, 180);
+      }
     },
   };
 
@@ -49,9 +65,8 @@ function showToast(msg, type = 'info') {
   t.textContent = msg;
   $('#toastRoot').appendChild(t);
   setTimeout(() => {
-    t.style.transition = 'opacity .3s';
-    t.style.opacity = '0';
-    setTimeout(() => t.remove(), 320);
+    t.classList.add('out');
+    setTimeout(() => t.remove(), 300);
   }, 2400);
 }
 
