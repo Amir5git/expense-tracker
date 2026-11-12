@@ -69,13 +69,44 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 ## Features
 
 **Transactions**
-- Add income and expenses with amount, category, date, payment method, note
+- Add income and expenses with amount, category, date, **account**, note
   and **tags**
 - 20 default categories (food, rent, transport, salary, freelance…) — fully
   customizable with your own names, emoji icons and colors
-- Payment methods: Cash, UPI, Card, Net Banking, Wallet, Other
-- Search, filter (type/category/date range/**tag**), and sort (date/amount)
+- Every transaction belongs to an **account**; the old payment method is
+  derived from the account type (bank → net banking, card → card, cash → cash,
+  UPI → UPI…) so method analytics keep working
+- Search, filter (type/category/**account**/date range/**tag**), and sort
+  (date/amount)
 - Infinite scroll with date grouping and per-day totals
+
+**Accounts & net worth**
+- Multiple accounts: **cash, bank, credit card, wallet, UPI, investment,
+  other** — create as many as you like (HDFC Savings, SBI Card, Paytm…)
+- **Opening balance** per account — the amount you had before you started
+  tracking. Negative values are allowed (credit-card dues, overdrafts)
+- Live balance per account = opening balance + income − expenses + transfers in
+  − transfers out
+- **Transfers** between accounts (bank → cash ATM withdrawal, paying a credit
+  card) that never pollute income/expense stats
+- Accounts page with total balance, **assets**, **liabilities** and
+  **net worth**; archive accounts instead of deleting so history is kept
+- Transactions created before accounts existed show up as *unassigned* and are
+  counted in the total until you assign them
+- Dashboard snapshot card shows your top accounts + net worth at a glance
+
+**CSV bank statement import**
+- Upload a CSV exported from your bank, then map columns in the UI — date,
+  description, amount, or separate debit/credit columns, an optional type
+  column and category column
+- Handles `DD/MM/YYYY`, `YYYY-MM-DD` and written dates, thousands separators,
+  parenthesised negatives and quoted fields; comma, semicolon and tab
+  delimiters are auto-detected
+- Rows are auto-categorized by the Smart Engine, assigned to the account you
+  pick and optionally tagged
+- **Duplicate detection** skips rows already in the app (and repeats inside the
+  file), so re-importing an overlapping statement is safe
+- Preview before importing; per-row errors are reported, max 5,000 rows / 5 MB
 
 **Smart Engine** (offline, no API keys, always free)
 - **Auto-categorization** while you type — learns from your history
@@ -130,10 +161,12 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
   active currency
 - Light / dark / system theme
 - AI assistant configuration (provider, key, model) with connection test
-- CSV export of transactions (includes tags)
-- Full JSON backup & restore (settings, categories, budgets, rules, tags)
+- CSV export of transactions (includes account + tags)
+- Full JSON backup & restore (settings, accounts, categories, transfers,
+  budgets, rules, tags) — v2 backups include accounts and transfers, and
+  older v1 backups still import
 - One-click sample data for exploring
-- Danger zone to wipe all data
+- Danger zone to wipe all data (accounts and categories are kept)
 
 **Platform**
 - Responsive: sidebar on desktop, bottom navigation + FAB on mobile
@@ -164,8 +197,8 @@ public/
     state.js            Shared state, helpers, formatting
     api.js              Fetch wrapper
     charts.js           SVG donut + bar charts, heatmap, weekday chart
-    modals.js           Transaction/category/budget/recurring dialogs
-    views.js            Dashboard/transactions/analytics/budgets/recurring/settings
+    modals.js           Transaction/account/transfer/CSV/category/budget/recurring dialogs
+    views.js            Dashboard/transactions/accounts/analytics/budgets/recurring/settings
     app.js              Router, theme, keyboard shortcuts, init
 scripts/gen-icons.js    Regenerates PWA icons (npm run icons)
 data/expenses.db        SQLite database (Node mode, created on first run)
@@ -175,14 +208,18 @@ data/expenses.db        SQLite database (Node mode, created on first run)
 
 | Method | Endpoint | Purpose |
 |---|---|---|
-| GET | `/api/bootstrap` | Settings, categories, currencies, AI status |
+| GET | `/api/bootstrap` | Settings, categories, accounts, currencies, AI status |
 | GET/PUT | `/api/settings` | Currency, theme, AI provider/key/model/base URL |
-| GET/POST/PUT/DELETE | `/api/transactions` | CRUD + filters/sort/search/tag/pagination |
+| GET/POST/PUT/DELETE | `/api/transactions` | CRUD + filters/sort/search/tag/account/pagination |
+| GET/POST/PUT/DELETE | `/api/accounts` | Accounts with balances, opening balance, archive |
+| GET/POST/DELETE | `/api/transfers` | Move money between accounts |
+| POST | `/api/import/csv/preview` | Parse a bank CSV → headers + sample rows |
+| POST | `/api/import/csv` | Import a mapped bank CSV with duplicate skipping |
 | GET | `/api/tags` | All tags in use |
 | GET/POST/PUT/DELETE | `/api/categories` | CRUD with usage protection |
 | GET/PUT/DELETE | `/api/budgets` | Monthly budgets + spent amounts |
 | GET/POST/PUT/DELETE | `/api/recurring` | Recurring rules, auto-processing |
-| GET | `/api/summary` | Dashboard aggregates (month, trends, charts, forecast) |
+| GET | `/api/summary` | Dashboard aggregates + account balances/net worth |
 | GET | `/api/smart/insights` | Generated insights feed for a month |
 | POST | `/api/smart/suggest` | Category/method suggestion for a note |
 | GET | `/api/smart/subscriptions` | Detected near-regular charges |
@@ -193,10 +230,10 @@ data/expenses.db        SQLite database (Node mode, created on first run)
 | POST | `/api/ai/parse` | Sentence → prefilled transaction (needs key) |
 | POST | `/api/ai/test` | Test the AI connection (needs key) |
 | GET | `/api/health` | Health check (for uptime monitors) |
-| GET | `/api/export?format=json\|csv` | Backup / CSV export |
-| POST | `/api/import` | Restore backup |
+| GET | `/api/export?format=json\|csv` | Backup (v2 incl. accounts + transfers) / CSV export |
+| POST | `/api/import` | Restore backup (v1 or v2) |
 | POST | `/api/sample-data` | Load demo data (only when empty) |
-| DELETE | `/api/data?confirm=DELETE` | Wipe transactions/budgets/rules |
+| DELETE | `/api/data?confirm=DELETE` | Wipe transactions/transfers/budgets/rules |
 
 `npm run tunnel` — expose the app on a temporary public `https://…trycloudflare.com`
 URL (for phone access when local Wi-Fi access is blocked).
@@ -264,8 +301,9 @@ starts.
    npm run deploy
    ```
 
-   The schema and default categories are created automatically on the first
-   request — no migration step needed.
+   The schema, default categories and two starter accounts (Cash, Bank
+   Account) are created automatically on the first request — no migration
+   step needed. Existing databases are upgraded in place.
 
 5. Open the printed `https://expense-tracker.<your-subdomain>.workers.dev`
    URL. On your phone: browser menu → **Add to Home screen** → the app
@@ -322,6 +360,13 @@ you exported from your local instance (Settings → Full backup → Download JSO
   | `npm run icons` | Regenerate PWA icons |
 
 - Regenerate icons after changing the design: `npm run icons`
+- **Set opening balances first** (Accounts → ✏️) so balances and net worth
+  start from reality. Negative opening balances model credit-card dues.
+- Deleting an account is blocked while transactions, recurring rules or
+  transfers use it — **archive** it instead to keep history but hide it from
+  pickers.
+- Transactions from before accounts existed appear under the **No account**
+  filter; edit them to assign an account and tighten your net worth.
 - Change the port: `PORT=8080 npm start` (or `set PORT=8080` on Windows)
 - The recurring engine runs on server start, on each relevant API call, and
   hourly — so due transactions are posted even if nobody opens the app.

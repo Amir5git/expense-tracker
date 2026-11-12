@@ -70,6 +70,7 @@ module.exports = function createSmart(ctx) {
     const row = await db.get('SELECT id FROM categories WHERE lower(name) = ? AND type = ?', [String(name).toLowerCase(), type]);
     return row ? row.id : null;
   }
+  void categoryIdByName; // kept for ad-hoc scripts; suggestions use the in-memory context
 
   /* ---------------- learned patterns (cached) ---------------- */
 
@@ -96,14 +97,27 @@ module.exports = function createSmart(ctx) {
   /**
    * Suggest a category + payment method for a new transaction.
    * Returns { category_id, method, confidence, source } or null.
+   *
+   * `buildContext()` loads everything the matcher needs in a couple of
+   * queries; `suggestFromContext()` is then pure. Bulk importers (CSV) build
+   * the context once and classify thousands of rows without touching the DB,
+   * which keeps them inside Cloudflare D1's free-plan query budget.
    */
-  async function suggest({ type, note, amount }) {
+  async function buildContext() {
+    const learned = await learnedPatterns();
+    const cats = await db.all('SELECT id, name, type FROM categories');
+    const catIdByName = new Map(cats.map(c => [`${c.name.toLowerCase()}|${c.type}`, c.id]));
+    return { learned, catIdByName };
+  }
+
+  function suggestFromContext(context, { type, note, amount }) {
     if (type !== 'income' && type !== 'expense') return null;
     const text = String(note || '');
     if (!tokens(text).length) return null;
 
+    const learned = context.learned[type] || [];
+
     // 1) exact learned note match ("swiggy order" seen before)
-    const learned = (await learnedPatterns())[type];
     const key = normKey(text);
     const exact = learned.filter(p => p.key === key);
     if (exact.length) {
@@ -137,13 +151,17 @@ module.exports = function createSmart(ctx) {
     for (const [catName, words] of Object.entries(hints)) {
       const hit = words.some(w => n.includes(w));
       if (hit) {
-        const id = await categoryIdByName(catName, type);
+        const id = context.catIdByName.get(`${catName.toLowerCase()}|${type}`);
         if (id && (!bestHint || words.length > bestHint.words)) bestHint = { id, words: words.length, name: catName };
       }
     }
     if (bestHint) return { category_id: bestHint.id, method: null, confidence: 0.5, source: 'keyword' };
 
     return null;
+  }
+
+  async function suggest(input) {
+    return suggestFromContext(await buildContext(), input);
   }
 
   /* ---------------- core data loading ---------------- */
@@ -637,7 +655,8 @@ module.exports = function createSmart(ctx) {
   }
 
   return {
-    suggest, insights, detectSubscriptions, budgetSuggestions,
+    suggest, buildContext, suggestFromContext,
+    insights, detectSubscriptions, budgetSuggestions,
     weekdayForecast, weekdayAverages, streaks, analytics,
     invalidatePatterns,
   };

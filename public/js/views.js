@@ -13,7 +13,10 @@ function txRowHTML(tx, { showDate = false, showMethod = true } = {}) {
   const isIncome = tx.type === 'income';
   const sub = [];
   if (tx.note) sub.push(esc(tx.category_name));
-  if (showMethod) sub.push(esc(METHOD_LABEL[tx.method] || tx.method));
+  if (showMethod) {
+    if (tx.account_name) sub.push(`${esc(tx.account_icon || '🏦')} ${esc(tx.account_name)}`);
+    else sub.push(esc(METHOD_LABEL[tx.method] || tx.method));
+  }
   if (tx.recurring_id) sub.push('🔁 auto');
   if (showDate) sub.push(esc(shortDate(tx.date)));
   return `
@@ -103,8 +106,30 @@ async function renderDashboard() {
   }
 
   const m = data.monthTotals;
-  const balance = data.allTime.income - data.allTime.expense;
+  const balance = data.totalBalance != null ? data.totalBalance : data.allTime.income - data.allTime.expense;
   const saved = m.income - m.expense;
+  const accountCount = (data.accounts || []).filter(a => !a.archived).length;
+  const unassignedCount = (data.unassigned && data.unassigned.count) || 0;
+
+  // accounts snapshot
+  const accountsCard = (data.accounts && data.accounts.length) ? `
+    <div class="card">
+      <div class="card-title">🏦 Accounts <span class="link" data-goto="accounts">Manage →</span></div>
+      <div class="account-mini-list">
+        ${data.accounts.filter(a => !a.archived).slice(0, 4).map(a => `
+          <div class="account-mini">
+            <span class="tx-icon small" style="background:${esc(a.color)}22">${esc(a.icon)}</span>
+            <span class="account-mini-name">${esc(a.name)}</span>
+            <b class="${a.balance < 0 ? 'expense' : ''}">${esc(fmtMoney(a.balance))}</b>
+          </div>`).join('')}
+      </div>
+      ${unassignedCount ? `<div class="help-text">${unassignedCount} transaction${unassignedCount === 1 ? '' : 's'} not linked to an account yet.</div>` : ''}
+      <div class="account-totals">
+        <span>Assets <b class="income">${esc(fmtMoney(data.assets || 0, { compact: true }))}</b></span>
+        <span>Liabilities <b class="expense">${esc(fmtMoney(data.liabilities || 0, { compact: true }))}</b></span>
+        <span>Net worth <b>${esc(fmtMoney(data.totalBalance || 0, { compact: true }))}</b></span>
+      </div>
+    </div>` : '';
 
   // budget strip
   let budgetHTML = '';
@@ -184,7 +209,7 @@ async function renderDashboard() {
       <div class="stat">
         <div class="stat-label">💰 Balance</div>
         <div class="stat-value">${esc(fmtMoney(balance))}</div>
-        <div class="stat-sub">${data.allTime.count} transactions · all time</div>
+        <div class="stat-sub">${accountCount} account${accountCount === 1 ? '' : 's'}${unassignedCount ? ` · ${unassignedCount} unassigned` : ''} · all time</div>
       </div>
       <div class="stat">
         <div class="stat-label">📥 Income</div>
@@ -202,6 +227,7 @@ async function renderDashboard() {
         <div class="stat-sub">${m.income > 0 ? (saved >= 0 ? 'Saved ' : 'Overspent ') + esc(fmtMoney(Math.abs(saved), { compact: true })) : 'No income this month'}</div>
       </div>
     </div>
+    ${accountsCard}
     ${insightsHTML}
     ${budgetHTML}
     <div class="grid-2">
@@ -363,6 +389,12 @@ async function renderTransactions() {
     State.tx.tags = await api.get('/api/tags');
   } catch { State.tx.tags = State.tx.tags || []; }
 
+  // keep account names/balances fresh for the filter
+  try {
+    const acc = await api.get('/api/accounts');
+    State.accounts = acc.accounts || State.accounts;
+  } catch { /* keep cached */ }
+
   $('#view').innerHTML = `
     <div class="card">
       <div class="filters">
@@ -375,6 +407,12 @@ async function renderTransactions() {
         <select class="input" id="fCat">
           <option value="">All categories</option>
           ${State.categories.map(c => `<option value="${c.id}" ${String(f.category) === String(c.id) ? 'selected' : ''}>${esc(c.icon)} ${esc(c.name)}</option>`).join('')}
+        </select>
+        <select class="input" id="fAccount">
+          <option value="">All accounts</option>
+          ${State.accounts.filter(a => !a.archived || String(f.account) === String(a.id)).map(a =>
+            `<option value="${a.id}" ${String(f.account) === String(a.id) ? 'selected' : ''}>${esc(a.icon)} ${esc(a.name)}</option>`).join('')}
+          <option value="none" ${f.account === 'none' ? 'selected' : ''}>No account</option>
         </select>
         <select class="input" id="fTag">
           <option value="">All tags</option>
@@ -405,6 +443,7 @@ async function renderTransactions() {
   }, 350));
   $('#fType').addEventListener('change', e => { f.type = e.target.value; loadTx(true); });
   $('#fCat').addEventListener('change', e => { f.category = e.target.value; loadTx(true); });
+  $('#fAccount').addEventListener('change', e => { f.account = e.target.value; loadTx(true); });
   $('#fTag').addEventListener('change', e => { f.tag = e.target.value; loadTx(true); });
   $('#fRange').addEventListener('change', e => {
     f.range = e.target.value;
@@ -435,7 +474,7 @@ async function loadTx(reset) {
 
   try {
     const data = await api.get('/api/transactions' + api.qs({
-      type: f.type, category: f.category, from, to, q: f.q, tag: f.tag, sort: f.sort, limit: 50, offset,
+      type: f.type, category: f.category, account: f.account, from, to, q: f.q, tag: f.tag, sort: f.sort, limit: 50, offset,
     }));
     State.tx.rows = reset ? data.rows : State.tx.rows.concat(data.rows);
     State.tx.total = data.total;
@@ -470,7 +509,7 @@ async function loadTx(reset) {
 
 function filtersEmpty() {
   const f = State.tx.filters;
-  return f.q || f.type || f.category || f.tag ? 'No results for these filters. Try changing them.' : 'No transactions in this period yet.';
+  return f.q || f.type || f.category || f.account || f.tag ? 'No results for these filters. Try changing them.' : 'No transactions in this period yet.';
 }
 
 function txListHTML(rows, { grouped = true, emptyLabel = 'No transactions yet.' } = {}) {
@@ -508,6 +547,116 @@ function txListHTML(rows, { grouped = true, emptyLabel = 'No transactions yet.' 
   }
   closeGroup();
   return html;
+}
+
+/* ============================================================
+   Accounts
+   ============================================================ */
+
+async function renderAccounts() {
+  setViewTitle('Accounts');
+  setViewActions('<button class="btn secondary" data-transfer>⇄ Transfer</button><button class="btn" data-new-account>+ Account</button>');
+
+  const view = $('#view');
+  view.innerHTML = '<div class="loading-block">Loading…</div>';
+
+  let data, transfers;
+  try {
+    [data, transfers] = await Promise.all([
+      api.get('/api/accounts'),
+      api.get('/api/transfers' + api.qs({ limit: 12 })).catch(() => []),
+    ]);
+  } catch (err) {
+    view.innerHTML = `<div class="card empty"><div class="empty-icon">⚠️</div><h3>Couldn't load accounts</h3><p>${esc(err.message)}</p></div>`;
+    return;
+  }
+
+  State.accounts = data.accounts || [];
+  const active = State.accounts.filter(a => !a.archived);
+  const archived = State.accounts.filter(a => a.archived);
+
+  const accountRow = a => `
+    <div class="account-row">
+      <div class="tx-icon" style="background:${esc(a.color)}22">${esc(a.icon)}</div>
+      <div class="tx-main">
+        <div class="tx-name">${esc(a.name)} ${a.archived ? '<span class="chip">archived</span>' : ''}</div>
+        <div class="tx-note">${esc(accountTypeMeta(a.type).label)} · opening ${esc(fmtMoney(a.opening_balance))} · ${a.tx_count} transaction${a.tx_count === 1 ? '' : 's'}</div>
+      </div>
+      <div class="account-balance ${a.balance < 0 ? 'expense' : ''}">${esc(fmtMoney(a.balance))}</div>
+      <div class="row-actions">
+        <button class="icon-btn" data-edit-account="${a.id}" title="Edit account">✏️</button>
+      </div>
+    </div>`;
+
+  const transfersHTML = transfers.length ? `
+    <div class="card">
+      <div class="card-title">Recent transfers</div>
+      ${transfers.map(t => `
+        <div class="transfer-row">
+          <div class="tx-icon small" style="background:${esc(t.from_color)}22">${esc(t.from_icon)}</div>
+          <div class="tx-main">
+            <div class="tx-name">${esc(t.from_name)} → ${esc(t.to_name)}</div>
+            <div class="tx-note">${esc(shortDate(t.date))}${t.note ? ' · ' + esc(t.note) : ''}</div>
+          </div>
+          <div class="tx-amount">${esc(fmtMoney(t.amount))}</div>
+          <div class="row-actions">
+            <button class="icon-btn danger" data-del-transfer="${t.id}" title="Delete transfer">🗑️</button>
+          </div>
+        </div>`).join('')}
+    </div>` : '';
+
+  view.innerHTML = `
+    <div class="stats-grid">
+      <div class="stat">
+        <div class="stat-label">🏦 Total balance</div>
+        <div class="stat-value">${esc(fmtMoney(data.totalBalance))}</div>
+        <div class="stat-sub">across ${active.length} active account${active.length === 1 ? '' : 's'}</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">📈 Assets</div>
+        <div class="stat-value income">${esc(fmtMoney(data.assets))}</div>
+        <div class="stat-sub">positive balances</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">📉 Liabilities</div>
+        <div class="stat-value expense">${esc(fmtMoney(data.liabilities))}</div>
+        <div class="stat-sub">credit cards & negatives</div>
+      </div>
+      <div class="stat">
+        <div class="stat-label">🧮 Net worth</div>
+        <div class="stat-value">${esc(fmtMoney(data.totalBalance))}</div>
+        <div class="stat-sub">assets minus liabilities</div>
+      </div>
+    </div>
+    ${data.unassigned && data.unassigned.count ? `
+      <div class="note-banner">
+        <span class="nb-icon">🔗</span>
+        <span>${data.unassigned.count} transaction${data.unassigned.count === 1 ? ' is' : 's are'} not linked to an account yet.
+        Edit them to assign one, or use the “No account” filter on the Transactions page.</span>
+      </div>` : ''}
+    <div class="card">
+      <div class="card-title">Your accounts <span class="link" data-new-account>+ Add</span></div>
+      ${active.length ? active.map(accountRow).join('') : '<div class="help-text">No active accounts yet.</div>'}
+      ${archived.length ? `<div class="account-section-label">Archived</div>${archived.map(accountRow).join('')}` : ''}
+    </div>
+    ${transfersHTML}`;
+
+  $$('[data-new-account]').forEach(b => b.addEventListener('click', () => openAccountModal()));
+  $$('[data-edit-account]').forEach(b => b.addEventListener('click', () => {
+    const a = State.accounts.find(x => x.id === Number(b.dataset.editAccount));
+    if (a) openAccountModal(a);
+  }));
+  const trBtn = $('[data-transfer]');
+  if (trBtn) trBtn.addEventListener('click', () => openTransferModal());
+  $$('[data-del-transfer]').forEach(b => b.addEventListener('click', async () => {
+    const ok = await confirmDialog({ title: 'Delete transfer?', message: 'Both account balances will go back to how they were before the transfer.' });
+    if (!ok) return;
+    try {
+      await api.del(`/api/transfers/${b.dataset.delTransfer}`);
+      showToast('Transfer deleted');
+      refreshView();
+    } catch (err) { showToast(err.message, 'error'); }
+  }));
 }
 
 /* ============================================================
@@ -767,6 +916,7 @@ async function renderRecurring() {
           <div class="tx-main">
             <div class="tx-name">${esc(r.note || r.category_name)}</div>
             <div class="tx-note">
+              ${r.account_name ? `${esc(r.account_icon || '🏦')} ${esc(r.account_name)} · ` : ''}
               ${esc(r.category_name)} · ${esc(FREQ_LABEL[r.frequency] || r.frequency)} ·
               next ${esc(shortDate(r.next_date))}${overdue ? ' · <b style="color:var(--warning)">posting soon</b>' : ''}
               ${r.active ? '' : ' · paused'}
@@ -814,10 +964,12 @@ async function renderSettings() {
   const phoneURL = location.origin;
   const isLocal = ['localhost', '127.0.0.1', '::1'].includes(location.hostname);
 
-  const [aiStatus, aiSettings] = await Promise.all([
+  const [aiStatus, aiSettings, accData] = await Promise.all([
     api.get('/api/ai/status').catch(() => ({ configured: false, provider: 'none', providers: [] })),
     api.get('/api/settings').catch(() => ({})),
+    api.get('/api/accounts').catch(() => ({ accounts: State.accounts })),
   ]);
+  if (accData && Array.isArray(accData.accounts)) State.accounts = accData.accounts;
   const aiDefaultModel = (aiStatus.providers.find(p => p.id === aiStatus.provider) || {}).defaultModel || '';
 
   $('#view').innerHTML = `
@@ -839,8 +991,12 @@ async function renderSettings() {
         </div>
       </div>
       <div class="field">
-        <label>Payment methods</label>
-        <div class="flex wrap">${METHODS.map(m => `<span class="chip">${esc(m.label)}</span>`).join('')}</div>
+        <label>Accounts</label>
+        <div class="flex wrap" style="align-items:center">
+          ${State.accounts.filter(a => !a.archived).map(a => `<span class="chip">${esc(a.icon)} ${esc(a.name)}</span>`).join('') || '<span class="help-text" style="margin:0">No accounts yet.</span>'}
+          <button class="btn small secondary" data-goto="accounts">Manage accounts</button>
+        </div>
+        <div class="help-text">The payment method on a transaction is derived from the account you pick (bank → net banking, card → card, etc.).</div>
       </div>
     </div>
 
@@ -909,11 +1065,15 @@ async function renderSettings() {
           <span class="v"><label class="btn small secondary" style="margin:0">Import JSON<input type="file" id="fileImport" accept=".json,application/json" hidden></label></span>
         </div>
         <div class="kv">
+          <span class="k">🏦 Import bank statement</span>
+          <span class="v"><button class="btn small secondary" id="btnCsvImport">Import CSV</button></span>
+        </div>
+        <div class="kv">
           <span class="k">🧪 Sample data</span>
           <span class="v"><button class="btn small secondary" id="btnSample">Load demo data</button></span>
         </div>
       </div>
-      <div class="help-text">Backups include settings, categories, budgets and recurring rules. Restoring replaces all current data.</div>
+      <div class="help-text">Backups include settings, accounts, categories, transfers, budgets and recurring rules. Restoring replaces all current data.</div>
     </div>
 
     <div class="card">
@@ -937,7 +1097,7 @@ async function renderSettings() {
           <span class="v"><button class="btn small danger" id="btnWipe">Delete everything</button></span>
         </div>
       </div>
-      <div class="help-text">Removes all transactions, budgets and recurring rules. Categories and settings are kept.</div>
+      <div class="help-text">Removes all transactions, transfers, budgets and recurring rules. Accounts, categories and settings are kept.</div>
     </div>
 
     <div class="card">
@@ -983,7 +1143,9 @@ async function renderSettings() {
   $('#btnExportCsv').addEventListener('click', () => downloadExport('csv'));
   $('#btnBackup').addEventListener('click', () => downloadExport('json'));
   $('#btnSample').addEventListener('click', () => loadSampleData());
+  $('#btnCsvImport').addEventListener('click', () => openCsvImportModal());
   $('#fileImport').addEventListener('change', importBackup);
+  $$('[data-goto]').forEach(b => b.addEventListener('click', () => { location.hash = '#/' + b.dataset.goto; }));
   $('#btnWipe').addEventListener('click', async () => {
     const ok = await confirmDialog({
       title: 'Delete ALL data?',

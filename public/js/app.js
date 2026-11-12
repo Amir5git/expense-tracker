@@ -4,13 +4,15 @@
    App entry — router, theme, init
    ============================================================ */
 
-const VIEWS = ['dashboard', 'transactions', 'analytics', 'budgets', 'recurring', 'settings'];
+const VIEWS = ['dashboard', 'transactions', 'accounts', 'analytics', 'budgets', 'recurring', 'settings'];
 
 async function init() {
   try {
     const boot = await api.get('/api/bootstrap');
     State.settings = boot.settings;
     State.categories = boot.categories;
+    State.accounts = boot.accounts || [];
+    State.accountTypes = boot.accountTypes || [];
     State.currencies = boot.currencies;
     State.methods = boot.methods;
     if (boot.ai) State.ai = boot.ai;
@@ -61,6 +63,7 @@ async function renderCurrent() {
   try {
     switch (State.view) {
       case 'transactions': await renderTransactions(); break;
+      case 'accounts': await renderAccounts(); break;
       case 'analytics': await renderAnalytics(); break;
       case 'budgets': await renderBudgets(); break;
       case 'recurring': await renderRecurring(); break;

@@ -144,6 +144,10 @@ function openTxModal(tx = null, prefill = null) {
   let categoryId = base.category_id || null;
   let categoryTouched = !!base.category_id;   // don't auto-suggest over an explicit choice
   const isNew = !tx;
+  const firstAccount = activeAccounts()[0];
+  let accountId = base.account_id != null
+    ? Number(base.account_id)
+    : (isNew ? (State.lastAccountId != null ? Number(State.lastAccountId) : (firstAccount ? firstAccount.id : null)) : null);
 
   const body = () => `
     <div class="field">
@@ -168,10 +172,11 @@ function openTxModal(tx = null, prefill = null) {
         <input class="input" data-role="tx-date" type="date" value="${base.date || todayStr()}">
       </div>
       <div class="field">
-        <label>Payment method</label>
-        <select class="input" data-role="tx-method">
-          ${METHODS.map(m => `<option value="${m.id}" ${base.method === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}
+        <label>Account</label>
+        <select class="input" data-role="tx-account">
+          ${accountOptionsHTML(accountId, !isNew)}
         </select>
+        <div class="help-text">Which balance did this come from? Payment method is set automatically.</div>
       </div>
     </div>
     <div class="field">
@@ -234,7 +239,7 @@ function openTxModal(tx = null, prefill = null) {
       modal.querySelector('[data-ok]').addEventListener('click', async () => {
         const amount = Number(m2(modal, 'tx-amount').value);
         const date = m2(modal, 'tx-date').value;
-        const method = m2(modal, 'tx-method').value;
+        const account_id = m2(modal, 'tx-account').value ? Number(m2(modal, 'tx-account').value) : null;
         const note = m2(modal, 'tx-note').value.trim();
         const tags = m2(modal, 'tx-tags').value;
 
@@ -242,11 +247,12 @@ function openTxModal(tx = null, prefill = null) {
         if (!categoryId) return showToast('Pick a category', 'error');
         if (!date) return showToast('Pick a date', 'error');
 
-        const payload = { type, amount, category_id: categoryId, date, note, method, tags };
+        const payload = { type, amount, category_id: categoryId, date, note, tags, account_id };
         try {
           modal.querySelector('[data-ok]').disabled = true;
           if (tx) await api.put(`/api/transactions/${tx.id}`, payload);
           else await api.post('/api/transactions', payload);
+          if (account_id) State.lastAccountId = account_id;
           showToast(tx ? 'Transaction updated' : `${type === 'income' ? 'Income' : 'Expense'} added`);
           closeModal(true);
           refreshView();
@@ -274,6 +280,22 @@ function openTxModal(tx = null, prefill = null) {
 }
 
 const m2 = (modal, role) => modal.querySelector(`[data-role="${role}"]`);
+
+function accountOptionsHTML(selectedId, includeNone = false) {
+  const list = activeAccounts();
+  const sel = selectedId != null ? Number(selectedId) : null;
+  const selectedAccount = sel != null ? State.accounts.find(a => a.id === sel) : null;
+  const options = [];
+  if (includeNone && sel == null) options.push('<option value="" selected>— Unassigned —</option>');
+  for (const a of list) {
+    options.push(`<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.icon)} ${esc(a.name)}</option>`);
+  }
+  if (selectedAccount && selectedAccount.archived && !list.some(a => a.id === sel)) {
+    options.push(`<option value="${sel}" selected>${esc(selectedAccount.icon)} ${esc(selectedAccount.name)} (archived)</option>`);
+  }
+  if (!options.length) options.push('<option value="">No accounts — create one first</option>');
+  return options.join('');
+}
 
 /* ============================================================
    Category modal
@@ -417,6 +439,10 @@ function openRecurringModal(rule = null, prefill = null) {
   const base = rule || prefill || {};
   let type = base.type || 'expense';
   let categoryId = base.category_id || null;
+  const firstAccount = activeAccounts()[0];
+  let accountId = base.account_id != null
+    ? Number(base.account_id)
+    : (rule ? null : (firstAccount ? firstAccount.id : null));
 
   const body = () => `
     <div class="field">
@@ -449,9 +475,9 @@ function openRecurringModal(rule = null, prefill = null) {
         <div class="help-text">The rule posts on this date and every cycle after.</div>
       </div>
       <div class="field">
-        <label>Payment method</label>
-        <select class="input" data-role="rec-method">
-          ${METHODS.map(m => `<option value="${m.id}" ${base.method === m.id ? 'selected' : ''}>${m.label}</option>`).join('')}
+        <label>Account</label>
+        <select class="input" data-role="rec-account">
+          ${accountOptionsHTML(accountId, !!rule)}
         </select>
       </div>
     </div>
@@ -478,13 +504,11 @@ function openRecurringModal(rule = null, prefill = null) {
         const amount = modal.querySelector('[data-role="rec-amount"]').value;
         const freq = modal.querySelector('[data-role="rec-freq"]').value;
         const next = modal.querySelector('[data-role="rec-next"]').value;
-        const method = modal.querySelector('[data-role="rec-method"]').value;
         const note = modal.querySelector('[data-role="rec-note"]').value;
         modal.querySelector('.modal-body').innerHTML = body();
         modal.querySelector('[data-role="rec-amount"]').value = amount;
         modal.querySelector('[data-role="rec-freq"]').value = freq;
         modal.querySelector('[data-role="rec-next"]').value = next;
-        modal.querySelector('[data-role="rec-method"]').value = method;
         modal.querySelector('[data-role="rec-note"]').value = note;
         wire();
         // re-read active state
@@ -501,6 +525,8 @@ function openRecurringModal(rule = null, prefill = null) {
             rerender();
           });
         });
+        const accSel = modal.querySelector('[data-role="rec-account"]');
+        if (accSel) accSel.addEventListener('change', e => { accountId = e.target.value ? Number(e.target.value) : null; });
         wireCatGrid(modal, () => categoryId, v => { categoryId = v; });
       };
       wire();
@@ -509,12 +535,11 @@ function openRecurringModal(rule = null, prefill = null) {
         const amount = Number(modal.querySelector('[data-role="rec-amount"]').value);
         const frequency = modal.querySelector('[data-role="rec-freq"]').value;
         const next_date = modal.querySelector('[data-role="rec-next"]').value;
-        const method = modal.querySelector('[data-role="rec-method"]').value;
         const note = modal.querySelector('[data-role="rec-note"]').value.trim();
         if (!amount || amount <= 0) return showToast('Enter an amount', 'error');
         if (!categoryId) return showToast('Pick a category', 'error');
         if (!next_date) return showToast('Pick the next date', 'error');
-        const payload = { type, amount, category_id: categoryId, frequency, next_date, note, method, active };
+        const payload = { type, amount, category_id: categoryId, frequency, next_date, note, active, account_id: accountId };
         try {
           if (rule) await api.put(`/api/recurring/${rule.id}`, payload);
           else await api.post('/api/recurring', payload);
@@ -534,6 +559,333 @@ function openRecurringModal(rule = null, prefill = null) {
           closeModal(true);
           refreshView();
         } catch (err) { showToast(err.message, 'error'); }
+      });
+    },
+  });
+}
+
+/* ============================================================
+   Account modal
+   ============================================================ */
+
+function openAccountModal(account = null) {
+  const isNew = !account;
+  let type = account ? account.type : 'bank';
+  let archived = account ? !!account.archived : false;
+  const meta = accountTypeMeta(type);
+
+  const body = `
+    <div class="field">
+      <label>Account name</label>
+      <input class="input" data-role="acc-name" maxlength="40" placeholder="e.g. HDFC Savings"
+        value="${account ? esc(account.name) : ''}" autocomplete="off">
+    </div>
+    <div class="field">
+      <label>Type</label>
+      <select class="input" data-role="acc-type">
+        ${accountTypes().map(t => `<option value="${t.id}" ${t.id === type ? 'selected' : ''}>${esc(t.icon)} ${esc(t.label)}</option>`).join('')}
+      </select>
+    </div>
+    <div class="field">
+      <label>Opening balance</label>
+      <input class="input input-lg" data-role="acc-opening" type="number" inputmode="decimal" step="0.01"
+        placeholder="0.00" value="${account ? esc(account.opening_balance) : ''}" autocomplete="off">
+      <div class="help-text">The balance you had before tracking started. Use a negative number for credit-card dues or overdrafts.</div>
+    </div>
+    ${isNew ? '' : `
+      <div class="field flex" style="gap:12px">
+        <button type="button" class="toggle ${archived ? 'on' : ''}" data-role="acc-archived" aria-label="Archived"></button>
+        <span style="font-size:13.5px;color:var(--text-2)">Archive this account (hidden from pickers, kept in history)</span>
+      </div>`}`;
+
+  openModal(modalShell(account ? 'Edit account' : 'New account', body,
+    account ? '<button class="btn danger" data-del>Delete</button>' : ''), {
+    async onMount(modal, closeModal) {
+      const typeSel = modal.querySelector('[data-role="acc-type"]');
+      typeSel.addEventListener('change', () => { type = typeSel.value; });
+
+      const tog = modal.querySelector('[data-role="acc-archived"]');
+      if (tog) tog.addEventListener('click', () => {
+        archived = !archived;
+        tog.classList.toggle('on', archived);
+      });
+
+      modal.querySelector('[data-ok]').addEventListener('click', async () => {
+        const name = modal.querySelector('[data-role="acc-name"]').value.trim();
+        const rawOpening = modal.querySelector('[data-role="acc-opening"]').value;
+        const opening = rawOpening === '' ? 0 : Number(rawOpening);
+        if (!name) return showToast('Enter an account name', 'error');
+        if (!isFinite(opening)) return showToast('Opening balance must be a number', 'error');
+        const tm = accountTypeMeta(type);
+        const payload = {
+          name, type, opening_balance: opening, archived,
+          icon: account && account.type === type ? account.icon : tm.icon,
+          color: account && account.type === type ? account.color : tm.color,
+        };
+        try {
+          if (account) await api.put(`/api/accounts/${account.id}`, payload);
+          else await api.post('/api/accounts', payload);
+          const acc = await api.get('/api/accounts');
+          State.accounts = acc.accounts || State.accounts;
+          showToast(account ? 'Account updated' : 'Account created');
+          closeModal(true);
+          refreshView();
+        } catch (err) { showToast(err.message, 'error'); }
+      });
+
+      const delBtn = modal.querySelector('[data-del]');
+      if (delBtn) delBtn.addEventListener('click', async () => {
+        const ok = await confirmDialog({
+          title: `Delete "${account.name}"?`,
+          message: 'Only accounts with no transactions, recurring rules or transfers can be deleted. Archive it instead to keep its history.',
+        });
+        if (!ok) return;
+        try {
+          await api.del(`/api/accounts/${account.id}`);
+          const acc = await api.get('/api/accounts');
+          State.accounts = acc.accounts || State.accounts;
+          showToast('Account deleted');
+          closeModal(true);
+          refreshView();
+        } catch (err) { showToast(err.message, 'error'); }
+      });
+    },
+  });
+}
+
+/* ============================================================
+   Transfer modal
+   ============================================================ */
+
+function openTransferModal() {
+  const accounts = activeAccounts();
+  if (accounts.length < 2) return showToast('Create at least two accounts first', 'error');
+
+  const options = sel => accounts.map(a =>
+    `<option value="${a.id}" ${a.id === sel ? 'selected' : ''}>${esc(a.icon)} ${esc(a.name)} — ${esc(fmtMoney(a.balance))}</option>`).join('');
+
+  const body = `
+    <div class="field-row">
+      <div class="field">
+        <label>From</label>
+        <select class="input" data-role="tr-from">${options(accounts[0].id)}</select>
+      </div>
+      <div class="field">
+        <label>To</label>
+        <select class="input" data-role="tr-to">${options(accounts[1].id)}</select>
+      </div>
+    </div>
+    <div class="field-row">
+      <div class="field">
+        <label>Amount</label>
+        <input class="input input-lg" data-role="tr-amount" type="number" inputmode="decimal" step="0.01" min="0" placeholder="0.00" autocomplete="off">
+      </div>
+      <div class="field">
+        <label>Date</label>
+        <input class="input" data-role="tr-date" type="date" value="${todayStr()}">
+      </div>
+    </div>
+    <div class="field">
+      <label>Note (optional)</label>
+      <input class="input" data-role="tr-note" maxlength="500" placeholder="e.g. ATM withdrawal" autocomplete="off">
+    </div>
+    <div class="help-text">Transfers move money between your accounts and don't count as income or expense.</div>`;
+
+  openModal(modalShell('Transfer between accounts', body, '', 'Transfer'), {
+    async onMount(modal, closeModal) {
+      modal.querySelector('[data-ok]').addEventListener('click', async () => {
+        const from_account_id = Number(modal.querySelector('[data-role="tr-from"]').value);
+        const to_account_id = Number(modal.querySelector('[data-role="tr-to"]').value);
+        const amount = Number(modal.querySelector('[data-role="tr-amount"]').value);
+        const date = modal.querySelector('[data-role="tr-date"]').value;
+        const note = modal.querySelector('[data-role="tr-note"]').value.trim();
+        if (from_account_id === to_account_id) return showToast('Pick two different accounts', 'error');
+        if (!amount || amount <= 0) return showToast('Enter an amount greater than zero', 'error');
+        if (!date) return showToast('Pick a date', 'error');
+        try {
+          modal.querySelector('[data-ok]').disabled = true;
+          await api.post('/api/transfers', { from_account_id, to_account_id, amount, date, note });
+          showToast('Transfer recorded');
+          closeModal(true);
+          refreshView();
+        } catch (err) {
+          modal.querySelector('[data-ok]').disabled = false;
+          showToast(err.message, 'error');
+        }
+      });
+    },
+  });
+}
+
+/* ============================================================
+   CSV bank statement import
+   ============================================================ */
+
+function openCsvImportModal() {
+  let csvText = '';
+  let headers = [];
+  let total = 0;
+  let ready = false;
+
+  const accountOptions = () => {
+    const list = activeAccounts();
+    if (!list.length) return '<option value="">No account</option>';
+    return list.map(a => `<option value="${a.id}">${esc(a.icon)} ${esc(a.name)}</option>`).join('');
+  };
+
+  const body = `
+    <div class="field">
+      <label>Bank statement CSV</label>
+      <input class="input" type="file" data-role="csv-file" accept=".csv,text/csv">
+      <div class="help-text">Export a CSV from your bank. The first row must contain column names.</div>
+    </div>
+    <div data-role="csv-map" style="display:none">
+      <div class="field">
+        <label>Import into account</label>
+        <select class="input" data-role="csv-account">${accountOptions()}</select>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Date column</label>
+          <select class="input" data-role="csv-date"></select>
+        </div>
+        <div class="field">
+          <label>Description column</label>
+          <select class="input" data-role="csv-desc"></select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Amount column</label>
+          <select class="input" data-role="csv-amount"></select>
+        </div>
+        <div class="field">
+          <label>Type column (optional)</label>
+          <select class="input" data-role="csv-type"></select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Debit column (optional)</label>
+          <select class="input" data-role="csv-debit"></select>
+        </div>
+        <div class="field">
+          <label>Credit column (optional)</label>
+          <select class="input" data-role="csv-credit"></select>
+        </div>
+      </div>
+      <div class="field-row">
+        <div class="field">
+          <label>Category column (optional)</label>
+          <select class="input" data-role="csv-category"></select>
+        </div>
+        <div class="field">
+          <label>Default type</label>
+          <select class="input" data-role="csv-default">
+            <option value="expense">Expense</option>
+            <option value="income">Income</option>
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label class="flex" style="align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13.5px">
+          <input type="checkbox" data-role="csv-invert"> Treat positive amounts as expenses
+        </label>
+        <label class="flex" style="align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-size:13.5px">
+          <input type="checkbox" data-role="csv-skip" checked> Skip transactions that already exist
+        </label>
+      </div>
+      <div class="field">
+        <label>Tags for imported rows (optional)</label>
+        <input class="input" data-role="csv-tags" maxlength="120" placeholder="e.g. imported,hdfc" autocomplete="off">
+      </div>
+      <div class="help-text" data-role="csv-summary"></div>
+    </div>`;
+
+  openModal(modalShell('Import bank statement', body, '', 'Import'), {
+    async onMount(modal, closeModal) {
+      const okBtn = modal.querySelector('[data-ok]');
+      okBtn.disabled = true;
+      const mapBox = modal.querySelector('[data-role="csv-map"]');
+      const summary = modal.querySelector('[data-role="csv-summary"]');
+
+      const select = role => modal.querySelector(`[data-role="${role}"]`);
+      const fill = (role, guessWords, allowNone = true) => {
+        const sel = select(role);
+        const guess = headers.find(h => guessWords.some(w => h.toLowerCase().includes(w))) || '';
+        sel.innerHTML = (allowNone ? '<option value="">— none —</option>' : '') +
+          headers.map(h => `<option value="${esc(h)}" ${h === guess ? 'selected' : ''}>${esc(h)}</option>`).join('');
+      };
+
+      select('csv-file').addEventListener('change', async e => {
+        const file = e.target.files && e.target.files[0];
+        if (!file) return;
+        try {
+          const text = await file.text();
+          const r = await api.post('/api/import/csv/preview', { csv: text });
+          csvText = text;
+          headers = r.headers || [];
+          total = r.total || 0;
+          ready = true;
+          fill('csv-date', ['date'], false);
+          fill('csv-desc', ['description', 'narration', 'particular', 'details', 'remark', 'memo', 'payee']);
+          fill('csv-amount', ['amount', 'value']);
+          fill('csv-type', ['type', 'dr/cr', 'debit/credit']);
+          fill('csv-debit', ['debit', 'withdrawal', 'dr']);
+          fill('csv-credit', ['credit', 'deposit', 'cr']);
+          fill('csv-category', ['category']);
+          mapBox.style.display = '';
+          okBtn.disabled = false;
+          summary.textContent = `${total} data row${total === 1 ? '' : 's'} found. Check the mapping, then import.`;
+          // If debit/credit columns exist, clear the single amount guess so they take priority.
+          if (select('csv-debit').value || select('csv-credit').value) select('csv-amount').value = '';
+        } catch (err) {
+          showToast(err.message, 'error');
+          ready = false;
+          okBtn.disabled = true;
+          mapBox.style.display = 'none';
+        }
+      });
+
+      okBtn.addEventListener('click', async () => {
+        if (!ready) return showToast('Choose a CSV file first', 'error');
+        const mapping = {
+          date: select('csv-date').value,
+          description: select('csv-desc').value,
+          amount: select('csv-amount').value,
+          type: select('csv-type').value,
+          debit: select('csv-debit').value,
+          credit: select('csv-credit').value,
+          category: select('csv-category').value,
+        };
+        if (!mapping.date) return showToast('Map the date column', 'error');
+        if (!mapping.amount && !mapping.debit && !mapping.credit) {
+          return showToast('Map an amount column, or debit/credit columns', 'error');
+        }
+        okBtn.disabled = true;
+        okBtn.textContent = 'Importing…';
+        try {
+          const r = await api.post('/api/import/csv', {
+            csv: csvText,
+            mapping,
+            account_id: select('csv-account').value || null,
+            default_type: select('csv-default').value,
+            invert_amount: select('csv-invert').checked,
+            skip_duplicates: select('csv-skip').checked,
+            tags: select('csv-tags').value,
+          });
+          const parts = [`Imported ${r.inserted}`];
+          if (r.skipped) parts.push(`${r.skipped} skipped`);
+          if (r.failed) parts.push(`${r.failed} failed`);
+          showToast(parts.join(' · '));
+          if (r.failed && r.errors && r.errors.length) console.warn('CSV import issues:', r.errors);
+          closeModal(true);
+          refreshView();
+        } catch (err) {
+          okBtn.disabled = false;
+          okBtn.textContent = 'Import';
+          showToast(err.message, 'error');
+        }
       });
     },
   });

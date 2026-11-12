@@ -19,6 +19,8 @@ const esc = s => String(s ?? '')
 const State = {
   settings: { currency: 'INR', theme: 'system' },
   categories: [],
+  accounts: [],
+  accountTypes: [],
   currencies: [],
   methods: [],
   ai: { configured: false, provider: 'none', model: '' },
@@ -27,7 +29,7 @@ const State = {
   dashboard: null,      // last summary payload
   budgetsCache: null,
   tx: {
-    filters: { type: '', category: '', range: 'month', from: '', to: '', q: '', tag: '', sort: 'date_desc' },
+    filters: { type: '', category: '', account: '', range: 'month', from: '', to: '', q: '', tag: '', sort: 'date_desc' },
     rows: [], total: 0, income: 0, expense: 0, loading: false, loadedAll: false,
   },
 };
@@ -44,6 +46,22 @@ const METHODS = [
 ];
 
 const METHOD_LABEL = Object.fromEntries(METHODS.map(m => [m.id, m.label]));
+
+const DEFAULT_ACCOUNT_TYPES = [
+  { id: 'cash', label: 'Cash', icon: '💵', color: '#00B894', method: 'cash' },
+  { id: 'bank', label: 'Bank', icon: '🏦', color: '#0984E3', method: 'netbanking' },
+  { id: 'credit_card', label: 'Credit card', icon: '💳', color: '#D63057', method: 'card' },
+  { id: 'wallet', label: 'Wallet', icon: '👛', color: '#FDCB6E', method: 'wallet' },
+  { id: 'upi', label: 'UPI', icon: '📱', color: '#6C5CE7', method: 'upi' },
+  { id: 'investment', label: 'Investment', icon: '📈', color: '#00CEC9', method: 'other' },
+  { id: 'other', label: 'Other', icon: '🧾', color: '#B2BEC3', method: 'other' },
+];
+function accountTypes() {
+  return State.accountTypes && State.accountTypes.length ? State.accountTypes : DEFAULT_ACCOUNT_TYPES;
+}
+function accountTypeMeta(type) {
+  return accountTypes().find(t => t.id === type) || DEFAULT_ACCOUNT_TYPES[6];
+}
 
 const FREQUENCIES = [
   { id: 'daily', label: 'Daily' },
@@ -152,6 +170,18 @@ function catsOf(type) {
 }
 function catById(id) {
   return State.categories.find(c => c.id === Number(id));
+}
+
+/* ---------- accounts ---------- */
+
+function accountById(id) {
+  return State.accounts.find(a => a.id === Number(id));
+}
+function activeAccounts() {
+  return State.accounts.filter(a => !a.archived);
+}
+function accountLabel(a) {
+  return `${a.icon || accountTypeMeta(a.type).icon} ${a.name}`;
 }
 
 /* ---------- tags ---------- */

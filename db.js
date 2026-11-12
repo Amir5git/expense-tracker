@@ -110,12 +110,13 @@ class D1DB {
   }
 
   /**
-   * Atomic multi-statement write. D1 has a per-invocation query limit on the
-   * free plan (50), so statements are chunked — each chunk runs in its own
-   * implicit transaction. Chunk size keeps well under the limit.
+   * Bulk multi-statement write. D1 counts a whole batch() as ONE query
+   * against the 50-queries-per-invocation free-plan limit, so chunks are
+   * sized to keep even a 5,000-row CSV import (plus its other queries) inside
+   * that budget. Each statement is still subject to the per-statement limits.
    */
   async batch(stmts) {
-    const CHUNK = 20;
+    const CHUNK = 250;
     const out = [];
     for (let i = 0; i < stmts.length; i += CHUNK) {
       const chunk = stmts.slice(i, i + CHUNK);

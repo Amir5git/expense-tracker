@@ -19,4 +19,4 @@ directory = "./public"
 binding = "DB"
 database_name = "expense-tracker"
 # Replace with the id printed by `npx wrangler d1 create expense-tracker`:
-database_id = "00000000-0000-4000-8000-000000000000"
+database_id = "b3986739-1789-4e2f-b9bc-394d1bb4b990"

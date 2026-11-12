@@ -209,10 +209,12 @@ svg { display: block; }
   justify-content: center;
   gap: 3px;
   color: var(--muted);
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 600;
+  min-width: 0;
 }
-#bottomnav a svg { width: 22px; height: 22px; }
+#bottomnav a span { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 100%; }
+#bottomnav a svg { width: 21px; height: 21px; }
 #bottomnav a.active { color: var(--primary); }
 
 /* FAB */
@@ -632,6 +634,70 @@ textarea.input { resize: vertical; min-height: 64px; }
 .row-actions .icon-btn { width: 32px; height: 32px; font-size: 14px; border: none; background: transparent; color: var(--text-2); }
 .row-actions .icon-btn:hover { background: var(--surface-2); color: var(--text); }
 .row-actions .icon-btn.danger:hover { color: var(--danger); }
+
+/* ---------- accounts ---------- */
+
+.account-mini-list { display: flex; flex-direction: column; }
+.account-mini {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.account-mini:last-child { border-bottom: none; }
+.account-mini-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  font-size: 14px;
+}
+.account-mini b { font-variant-numeric: tabular-nums; }
+.account-totals {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.account-totals b { color: var(--text); }
+.account-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 11px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.account-row:last-child { border-bottom: none; }
+.account-row .tx-main { flex: 1; min-width: 0; }
+.account-balance {
+  font-weight: 800;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.account-section-label {
+  margin: 16px 4px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--muted);
+}
+.transfer-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.transfer-row:last-child { border-bottom: none; }
+.transfer-row .tx-main { flex: 1; min-width: 0; }
 
 /* ---------- charts ---------- */
 

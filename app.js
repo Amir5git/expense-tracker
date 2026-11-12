@@ -51,6 +51,24 @@ const METHODS = [
   { id: 'other', label: 'Other' },
 ];
 
+/* Account types. `method` is what the old payment-method field becomes when
+   a transaction is linked to an account, so analytics keep working. */
+const ACCOUNT_TYPES = [
+  { id: 'cash', label: 'Cash', icon: '💵', color: '#00B894', method: 'cash' },
+  { id: 'bank', label: 'Bank', icon: '🏦', color: '#0984E3', method: 'netbanking' },
+  { id: 'credit_card', label: 'Credit card', icon: '💳', color: '#D63057', method: 'card' },
+  { id: 'wallet', label: 'Wallet', icon: '👛', color: '#FDCB6E', method: 'wallet' },
+  { id: 'upi', label: 'UPI', icon: '📱', color: '#6C5CE7', method: 'upi' },
+  { id: 'investment', label: 'Investment', icon: '📈', color: '#00CEC9', method: 'other' },
+  { id: 'other', label: 'Other', icon: '🧾', color: '#B2BEC3', method: 'other' },
+];
+const ACCOUNT_TYPE_MAP = Object.fromEntries(ACCOUNT_TYPES.map(t => [t.id, t]));
+
+const DEFAULT_ACCOUNTS = [
+  { name: 'Cash', type: 'cash', icon: '💵', color: '#00B894' },
+  { name: 'Bank Account', type: 'bank', icon: '🏦', color: '#0984E3' },
+];
+
 const DEFAULT_CATEGORIES = [
   // expenses
   { name: 'Food & Dining', type: 'expense', icon: '🍜', color: '#FF6B6B' },
@@ -92,6 +110,16 @@ CREATE TABLE IF NOT EXISTS categories (
   is_default INTEGER NOT NULL DEFAULT 0,
   UNIQUE (name, type)
 );
+CREATE TABLE IF NOT EXISTS accounts (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  name            TEXT    NOT NULL,
+  type            TEXT    NOT NULL CHECK (type IN ('cash','bank','credit_card','wallet','upi','investment','other')),
+  opening_balance REAL    NOT NULL DEFAULT 0,
+  icon            TEXT    NOT NULL DEFAULT '💵',
+  color           TEXT    NOT NULL DEFAULT '#00B894',
+  archived        INTEGER NOT NULL DEFAULT 0,
+  created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
 CREATE TABLE IF NOT EXISTS recurring (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   type        TEXT NOT NULL CHECK (type IN ('income','expense')),
@@ -102,7 +130,8 @@ CREATE TABLE IF NOT EXISTS recurring (
   frequency   TEXT NOT NULL CHECK (frequency IN ('daily','weekly','monthly','yearly')),
   next_date   TEXT NOT NULL,
   active      INTEGER NOT NULL DEFAULT 1,
-  last_run    TEXT
+  last_run    TEXT,
+  account_id  INTEGER REFERENCES accounts(id)
 );
 CREATE TABLE IF NOT EXISTS transactions (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -114,11 +143,22 @@ CREATE TABLE IF NOT EXISTS transactions (
   method       TEXT NOT NULL DEFAULT 'cash',
   recurring_id INTEGER REFERENCES recurring(id) ON DELETE SET NULL,
   created_at   TEXT NOT NULL DEFAULT (datetime('now')),
-  tags         TEXT NOT NULL DEFAULT ''
+  tags         TEXT NOT NULL DEFAULT '',
+  account_id   INTEGER REFERENCES accounts(id)
 );
 CREATE INDEX IF NOT EXISTS idx_tx_date     ON transactions(date);
 CREATE INDEX IF NOT EXISTS idx_tx_category  ON transactions(category_id);
 CREATE INDEX IF NOT EXISTS idx_tx_recurring ON transactions(recurring_id);
+CREATE TABLE IF NOT EXISTS transfers (
+  id              INTEGER PRIMARY KEY AUTOINCREMENT,
+  from_account_id INTEGER NOT NULL REFERENCES accounts(id),
+  to_account_id   INTEGER NOT NULL REFERENCES accounts(id),
+  amount          REAL NOT NULL CHECK (amount > 0),
+  date            TEXT NOT NULL,
+  note            TEXT NOT NULL DEFAULT '',
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_transfers_date ON transfers(date);
 CREATE TABLE IF NOT EXISTS budgets (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   category_id INTEGER NOT NULL UNIQUE REFERENCES categories(id) ON DELETE CASCADE,
@@ -189,6 +229,92 @@ function advanceDate(dateStr, frequency) {
 function escapeLike(s) { return String(s).replace(/[\\%_]/g, c => '\\' + c); }
 
 /* ------------------------------------------------------------------ */
+/* CSV helpers (bank statement import)                                 */
+/* ------------------------------------------------------------------ */
+
+function detectDelimiter(text) {
+  const first = String(text).replace(/^\uFEFF/, '').split(/\r?\n/)[0] || '';
+  const commas = (first.match(/,/g) || []).length;
+  const semis = (first.match(/;/g) || []).length;
+  const tabs = (first.match(/\t/g) || []).length;
+  if (tabs > commas && tabs > semis) return '\t';
+  return semis > commas ? ';' : ',';
+}
+
+function parseCsv(text) {
+  const src = String(text || '').replace(/^\uFEFF/, '');
+  const delim = detectDelimiter(src);
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+
+  for (let i = 0; i < src.length; i++) {
+    const ch = src[i];
+    if (inQuotes) {
+      if (ch === '"') {
+        if (src[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += ch;
+      continue;
+    }
+    if (ch === '"') { inQuotes = true; continue; }
+    if (ch === delim) { row.push(field); field = ''; continue; }
+    if (ch === '\n') { row.push(field); rows.push(row); row = []; field = ''; continue; }
+    if (ch === '\r') continue;
+    field += ch;
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(c => String(c).trim() !== ''));
+}
+
+function parseCsvDate(value) {
+  const s = String(value == null ? '' : value).trim();
+  if (!s) return null;
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})/.exec(s);
+  if (m) {
+    const out = `${m[1]}-${pad2(m[2])}-${pad2(m[3])}`;
+    return validDate(out) ? out : null;
+  }
+  m = /^(\d{1,2})[\/\-.](\d{1,2})[\/\-.](\d{2,4})/.exec(s);
+  if (m) {
+    let [, d, mo, y] = m;
+    if (y.length === 2) y = '20' + y;
+    const out = `${y}-${pad2(mo)}-${pad2(d)}`;
+    return validDate(out) ? out : null;
+  }
+  // "12 Nov 2026", "Nov 12, 2026"
+  const t = Date.parse(s);
+  if (!isNaN(t)) {
+    const d = new Date(t);
+    return validDate(fmtDate(d)) ? fmtDate(d) : null;
+  }
+  return null;
+}
+
+function parseCsvAmount(value) {
+  let s = String(value == null ? '' : value).trim();
+  if (!s) return null;
+  let negative = false;
+  if (/^\(.*\)$/.test(s)) { negative = true; s = s.slice(1, -1); }
+  s = s.replace(/[^0-9.,-]/g, '');
+  if (!s) return null;
+  if (s.includes(',') && s.includes('.')) s = s.replace(/,/g, '');
+  else if (s.includes(',')) {
+    const parts = s.split(',');
+    s = (parts.length === 2 && parts[1].length <= 2) ? parts[0] + '.' + parts[1] : s.replace(/,/g, '');
+  }
+  const n = Number(s);
+  if (!isFinite(n)) return null;
+  return negative ? -Math.abs(n) : n;
+}
+
+function normalizeHeader(h, index) {
+  const s = String(h == null ? '' : h).trim();
+  return s || `Column ${index + 1}`;
+}
+
+/* ------------------------------------------------------------------ */
 /* Schema init (idempotent, race-safe across isolates/processes)       */
 /* ------------------------------------------------------------------ */
 
@@ -197,7 +323,7 @@ async function ensureSchema(db) {
   // as "not initialized" instead of an error.
   let marker = null;
   try {
-    marker = await db.get("SELECT value FROM settings WHERE key = 'schema_v1'");
+    marker = await db.get("SELECT value FROM settings WHERE key = 'schema_v2'");
   } catch { /* no schema yet */ }
   if (marker && marker.value === 'ok') return;
 
@@ -205,12 +331,28 @@ async function ensureSchema(db) {
   // databases from before the tags feature (tags is in SCHEMA_SQL for new ones)
   try { await db.exec("ALTER TABLE transactions ADD COLUMN tags TEXT NOT NULL DEFAULT ''"); }
   catch (err) { if (!/duplicate column/i.test(String(err && err.message))) throw err; }
+  // databases from before accounts/opening balances
+  try { await db.exec('ALTER TABLE transactions ADD COLUMN account_id INTEGER REFERENCES accounts(id)'); }
+  catch (err) { if (!/duplicate column/i.test(String(err && err.message))) throw err; }
+  try { await db.exec('ALTER TABLE recurring ADD COLUMN account_id INTEGER REFERENCES accounts(id)'); }
+  catch (err) { if (!/duplicate column/i.test(String(err && err.message))) throw err; }
+  await db.exec('CREATE INDEX IF NOT EXISTS idx_tx_account ON transactions(account_id)');
 
   const seedCat = 'INSERT INTO categories (name, type, icon, color, is_default) VALUES (?, ?, ?, ?, 1) ON CONFLICT (name, type) DO NOTHING';
   for (const c of DEFAULT_CATEGORIES) await db.run(seedCat, [c.name, c.type, c.icon, c.color]);
+
+  // Give every database a sensible starting set of accounts (only once).
+  const accountCount = await db.get('SELECT COUNT(*) AS c FROM accounts');
+  if (!accountCount || !accountCount.c) {
+    for (const a of DEFAULT_ACCOUNTS) {
+      await db.run('INSERT INTO accounts (name, type, opening_balance, icon, color) VALUES (?, ?, 0, ?, ?)',
+        [a.name, a.type, a.icon, a.color]);
+    }
+  }
+
   await db.run("INSERT INTO settings (key, value) VALUES ('currency', 'INR') ON CONFLICT (key) DO NOTHING");
   await db.run("INSERT INTO settings (key, value) VALUES ('theme', 'system') ON CONFLICT (key) DO NOTHING");
-  await db.run("INSERT INTO settings (key, value) VALUES ('schema_v1', 'ok') ON CONFLICT (key) DO NOTHING");
+  await db.run("INSERT INTO settings (key, value) VALUES ('schema_v2', 'ok') ON CONFLICT (key) DO NOTHING");
 }
 
 /* ------------------------------------------------------------------ */
@@ -230,10 +372,37 @@ function createApp(db, opts = {}) {
   async function getCategory(id) {
     return db.get('SELECT * FROM categories WHERE id = ?', [id]);
   }
+  async function getAccount(id) {
+    return db.get('SELECT * FROM accounts WHERE id = ?', [id]);
+  }
+  function accountMethod(account) {
+    return (ACCOUNT_TYPE_MAP[account && account.type] || {}).method || 'other';
+  }
+  async function accountBalances() {
+    return db.all(`
+      SELECT a.*,
+        a.opening_balance
+        + COALESCE((SELECT SUM(CASE WHEN t.type = 'income' THEN t.amount ELSE -t.amount END)
+                    FROM transactions t WHERE t.account_id = a.id), 0)
+        + COALESCE((SELECT SUM(amount) FROM transfers WHERE to_account_id = a.id), 0)
+        - COALESCE((SELECT SUM(amount) FROM transfers WHERE from_account_id = a.id), 0) AS balance,
+        (SELECT COUNT(*) FROM transactions t WHERE t.account_id = a.id) AS tx_count
+      FROM accounts a
+      ORDER BY a.archived, a.name`);
+  }
+  async function unassignedTotals() {
+    return db.get(`
+      SELECT COUNT(*) AS count,
+             COALESCE(SUM(CASE WHEN type = 'income' THEN amount ELSE -amount END), 0) AS net
+      FROM transactions WHERE account_id IS NULL`);
+  }
   async function txRow(id) {
     return db.get(`
-      SELECT t.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color
-      FROM transactions t JOIN categories c ON c.id = t.category_id
+      SELECT t.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color,
+             a.name AS account_name, a.icon AS account_icon, a.color AS account_color, a.type AS account_type
+      FROM transactions t
+      JOIN categories c ON c.id = t.category_id
+      LEFT JOIN accounts a ON a.id = t.account_id
       WHERE t.id = ?`, [id]);
   }
   async function currencySymbol() {
@@ -278,8 +447,8 @@ function createApp(db, opts = {}) {
         let guard = 0;
         while (next <= today && guard < 5000) {
           stmts.push({
-            sql: 'INSERT INTO transactions (type, amount, category_id, date, note, method, recurring_id) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            params: [rule.type, rule.amount, rule.category_id, next, rule.note || '', rule.method || 'cash', rule.id],
+            sql: 'INSERT INTO transactions (type, amount, category_id, date, note, method, recurring_id, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+            params: [rule.type, rule.amount, rule.category_id, next, rule.note || '', rule.method || 'cash', rule.id, rule.account_id ?? null],
           });
           next = advanceDate(next, rule.frequency);
           guard++;
@@ -334,6 +503,8 @@ function createApp(db, opts = {}) {
     return c.json({
       settings: { currency: await getSetting('currency', 'INR'), theme: await getSetting('theme', 'system') },
       categories: await db.all('SELECT * FROM categories ORDER BY type, name'),
+      accounts: await accountBalances(),
+      accountTypes: ACCOUNT_TYPES,
       methods: METHODS,
       currencies: CURRENCIES,
       ai: await AILayer.status(),
@@ -382,12 +553,14 @@ function createApp(db, opts = {}) {
   /* ---- transactions ---- */
   app.get('/api/transactions', async (c) => {
     await processRecurring();
-    const { type, category, from, to, q, tag, sort } = c.req.query();
+    const { type, category, account, from, to, q, tag, sort } = c.req.query();
 
     const where = [];
     const params = [];
     if (type === 'income' || type === 'expense') { where.push('t.type = ?'); params.push(type); }
     if (category && Number.isInteger(Number(category))) { where.push('t.category_id = ?'); params.push(Number(category)); }
+    if (account === 'none') { where.push('t.account_id IS NULL'); }
+    else if (account && Number.isInteger(Number(account))) { where.push('t.account_id = ?'); params.push(Number(account)); }
     if (validDate(from)) { where.push('t.date >= ?'); params.push(from); }
     if (validDate(to)) { where.push('t.date <= ?'); params.push(to); }
     if (tag && String(tag).trim()) {
@@ -400,6 +573,7 @@ function createApp(db, opts = {}) {
       params.push(like, like);
     }
     const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
+    const joins = 'FROM transactions t JOIN categories c ON c.id = t.category_id LEFT JOIN accounts a ON a.id = t.account_id';
 
     const SORTS = {
       date_desc: 't.date DESC, t.id DESC',
@@ -413,18 +587,19 @@ function createApp(db, opts = {}) {
     const off = Math.max(Number(c.req.query('offset')) || 0, 0);
 
     const rows = await db.all(`
-      SELECT t.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color
-      FROM transactions t JOIN categories c ON c.id = t.category_id
+      SELECT t.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color,
+             a.name AS account_name, a.icon AS account_icon, a.color AS account_color, a.type AS account_type
+      ${joins}
       ${whereSql} ORDER BY ${sortSql} LIMIT ? OFFSET ?`, [...params, lim, off]);
 
     const total = (await db.get(`
-      SELECT COUNT(*) AS c FROM transactions t JOIN categories c ON c.id = t.category_id ${whereSql}`, params)).c;
+      SELECT COUNT(*) AS c ${joins} ${whereSql}`, params)).c;
 
     const sums = await db.get(`
       SELECT
         COALESCE(SUM(CASE WHEN t.type = 'income'  THEN t.amount END), 0) AS income,
         COALESCE(SUM(CASE WHEN t.type = 'expense' THEN t.amount END), 0) AS expense
-      FROM transactions t JOIN categories c ON c.id = t.category_id ${whereSql}`, params);
+      ${joins} ${whereSql}`, params);
 
     return c.json({ rows, total, income: sums.income, expense: sums.expense, limit: lim, offset: off });
   });
@@ -455,11 +630,23 @@ function createApp(db, opts = {}) {
       if (!validDate(date)) return { error: 'Invalid date (expected YYYY-MM-DD)' };
       out.date = date;
     }
-    if (!partial || b.method !== undefined) {
-      const method = b.method ?? existing?.method ?? 'cash';
+    if (!partial || b.account_id !== undefined) {
+      const raw = b.account_id ?? existing?.account_id ?? null;
+      if (raw === null || raw === '' || raw === 0) {
+        out.account_id = null;
+      } else {
+        const acc = await getAccount(Number(raw));
+        if (!acc) return { error: 'Account not found' };
+        out.account_id = acc.id;
+        out._account_method = accountMethod(acc);
+      }
+    }
+    if (!partial || b.method !== undefined || out._account_method !== undefined) {
+      const method = b.method ?? out._account_method ?? existing?.method ?? 'cash';
       if (!METHODS.some(m => m.id === method)) return { error: 'Invalid payment method' };
       out.method = method;
     }
+    delete out._account_method;
     if (!partial || b.note !== undefined) {
       const note = b.note ?? existing?.note ?? '';
       if (typeof note !== 'string' || note.length > 500) return { error: 'Note must be 500 characters or fewer' };
@@ -482,10 +669,10 @@ function createApp(db, opts = {}) {
   app.post('/api/transactions', async (c) => {
     const v = await validateTxBody(await readJson(c));
     if (v.error) return c.json({ error: v.error }, 400);
-    const { type, amount, category_id, date, note, method, tags } = v.value;
+    const { type, amount, category_id, date, note, method, tags, account_id } = v.value;
     const info = await db.run(`
-      INSERT INTO transactions (type, amount, category_id, date, note, method, tags)
-      VALUES (?, ?, ?, ?, ?, ?, ?)`, [type, amount, category_id, date, note, method, tags || '']);
+      INSERT INTO transactions (type, amount, category_id, date, note, method, tags, account_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, [type, amount, category_id, date, note, method, tags || '', account_id ?? null]);
     SmartEngine.invalidatePatterns();
     return c.json(await txRow(info.lastInsertRowid), 201);
   });
@@ -498,9 +685,9 @@ function createApp(db, opts = {}) {
     if (v.error) return c.json({ error: v.error }, 400);
     const next = { ...existing, ...v.value };
     await db.run(`
-      UPDATE transactions SET type = ?, amount = ?, category_id = ?, date = ?, note = ?, method = ?, tags = ?
+      UPDATE transactions SET type = ?, amount = ?, category_id = ?, date = ?, note = ?, method = ?, tags = ?, account_id = ?
       WHERE id = ?`,
-      [next.type, next.amount, next.category_id, next.date, next.note, next.method, next.tags || '', id]);
+      [next.type, next.amount, next.category_id, next.date, next.note, next.method, next.tags || '', next.account_id ?? null, id]);
     SmartEngine.invalidatePatterns();
     return c.json(await txRow(id));
   });
@@ -509,6 +696,132 @@ function createApp(db, opts = {}) {
     const info = await db.run('DELETE FROM transactions WHERE id = ?', [Number(c.req.param('id'))]);
     if (info.changes === 0) return c.json({ error: 'Transaction not found' }, 404);
     SmartEngine.invalidatePatterns();
+    return c.json({ ok: true });
+  });
+
+  /* ---- accounts ---- */
+  function validateAccount(body, existing) {
+    const b = body || {};
+    const name = String(b.name ?? existing?.name ?? '').trim();
+    if (!name || name.length > 40) return { error: 'Name must be 1-40 characters' };
+    const type = b.type ?? existing?.type ?? 'cash';
+    const meta = ACCOUNT_TYPE_MAP[type];
+    if (!meta) return { error: 'Invalid account type' };
+    const rawOpening = b.opening_balance ?? existing?.opening_balance ?? 0;
+    const opening = Number(rawOpening);
+    if (rawOpening === '' || !isFinite(opening) || Math.abs(opening) >= 1e13) {
+      return { error: 'Opening balance must be a number' };
+    }
+    const icon = String(b.icon ?? existing?.icon ?? meta.icon);
+    if (!icon.length || icon.length > 8) return { error: 'Invalid icon' };
+    const color = String(b.color ?? existing?.color ?? meta.color);
+    if (!/^#[0-9a-fA-F]{6}$/.test(color)) return { error: 'Invalid color' };
+    const archived = b.archived === undefined ? (existing?.archived ? 1 : 0) : (b.archived ? 1 : 0);
+    return {
+      value: {
+        name, type, opening_balance: Math.round(opening * 100) / 100,
+        icon, color, archived,
+      },
+    };
+  }
+
+  app.get('/api/accounts', async (c) => {
+    const accounts = await accountBalances();
+    const unassigned = await unassignedTotals();
+    const totalBalance = accounts.reduce((s, a) => s + a.balance, 0) + unassigned.net;
+    const assets = accounts.reduce((s, a) => s + Math.max(a.balance, 0), 0) + Math.max(unassigned.net, 0);
+    const liabilities = accounts.reduce((s, a) => s + Math.max(-a.balance, 0), 0) + Math.max(-unassigned.net, 0);
+    return c.json({
+      accounts, accountTypes: ACCOUNT_TYPES, unassigned,
+      totalBalance, assets, liabilities,
+    });
+  });
+
+  app.post('/api/accounts', async (c) => {
+    const v = validateAccount(await readJson(c));
+    if (v.error) return c.json({ error: v.error }, 400);
+    const a = v.value;
+    const info = await db.run(`
+      INSERT INTO accounts (name, type, opening_balance, icon, color, archived)
+      VALUES (?, ?, ?, ?, ?, ?)`, [a.name, a.type, a.opening_balance, a.icon, a.color, a.archived]);
+    return c.json(await db.get('SELECT * FROM accounts WHERE id = ?', [info.lastInsertRowid]), 201);
+  });
+
+  app.put('/api/accounts/:id', async (c) => {
+    const id = Number(c.req.param('id'));
+    const existing = await getAccount(id);
+    if (!existing) return c.json({ error: 'Account not found' }, 404);
+    const v = validateAccount(await readJson(c), existing);
+    if (v.error) return c.json({ error: v.error }, 400);
+    const a = v.value;
+    await db.run(`
+      UPDATE accounts SET name = ?, type = ?, opening_balance = ?, icon = ?, color = ?, archived = ?
+      WHERE id = ?`, [a.name, a.type, a.opening_balance, a.icon, a.color, a.archived, id]);
+    return c.json(await db.get('SELECT * FROM accounts WHERE id = ?', [id]));
+  });
+
+  app.delete('/api/accounts/:id', async (c) => {
+    const id = Number(c.req.param('id'));
+    const account = await getAccount(id);
+    if (!account) return c.json({ error: 'Account not found' }, 404);
+    const txCount = (await db.get('SELECT COUNT(*) AS c FROM transactions WHERE account_id = ?', [id])).c;
+    const recCount = (await db.get('SELECT COUNT(*) AS c FROM recurring WHERE account_id = ?', [id])).c;
+    const trCount = (await db.get('SELECT COUNT(*) AS c FROM transfers WHERE from_account_id = ? OR to_account_id = ?', [id, id])).c;
+    if (txCount || recCount || trCount) {
+      return c.json({
+        error: `Cannot delete: account is used by ${txCount} transaction(s), ${recCount} recurring rule(s) and ${trCount} transfer(s). Archive it instead, or reassign those entries.`,
+      }, 409);
+    }
+    await db.run('DELETE FROM accounts WHERE id = ?', [id]);
+    return c.json({ ok: true });
+  });
+
+  /* ---- transfers ---- */
+  const transferSelect = `
+    SELECT tr.*, f.name AS from_name, f.icon AS from_icon, f.color AS from_color,
+           t.name AS to_name, t.icon AS to_icon, t.color AS to_color
+    FROM transfers tr
+    JOIN accounts f ON f.id = tr.from_account_id
+    JOIN accounts t ON t.id = tr.to_account_id`;
+
+  app.get('/api/transfers', async (c) => {
+    const lim = Math.min(Math.max(Number(c.req.query('limit')) || 50, 1), 200);
+    return c.json(await db.all(`${transferSelect} ORDER BY tr.date DESC, tr.id DESC LIMIT ?`, [lim]));
+  });
+
+  async function validateTransfer(body) {
+    const b = body || {};
+    const from = await getAccount(Number(b.from_account_id));
+    const to = await getAccount(Number(b.to_account_id));
+    if (!from) return { error: 'Source account not found' };
+    if (!to) return { error: 'Destination account not found' };
+    if (from.id === to.id) return { error: 'Pick two different accounts' };
+    if (!validAmount(b.amount)) return { error: 'Amount must be a positive number' };
+    if (!validDate(b.date)) return { error: 'Invalid date (expected YYYY-MM-DD)' };
+    const note = b.note ?? '';
+    if (typeof note !== 'string' || note.length > 500) return { error: 'Note must be 500 characters or fewer' };
+    return {
+      value: {
+        from_account_id: from.id, to_account_id: to.id,
+        amount: Math.round(Number(b.amount) * 100) / 100,
+        date: b.date, note: note.trim(),
+      },
+    };
+  }
+
+  app.post('/api/transfers', async (c) => {
+    const v = await validateTransfer(await readJson(c));
+    if (v.error) return c.json({ error: v.error }, 400);
+    const t = v.value;
+    const info = await db.run(`
+      INSERT INTO transfers (from_account_id, to_account_id, amount, date, note)
+      VALUES (?, ?, ?, ?, ?)`, [t.from_account_id, t.to_account_id, t.amount, t.date, t.note]);
+    return c.json(await db.get(`${transferSelect} WHERE tr.id = ?`, [info.lastInsertRowid]), 201);
+  });
+
+  app.delete('/api/transfers/:id', async (c) => {
+    const info = await db.run('DELETE FROM transfers WHERE id = ?', [Number(c.req.param('id'))]);
+    if (info.changes === 0) return c.json({ error: 'Transfer not found' }, 404);
     return c.json({ ok: true });
   });
 
@@ -621,8 +934,11 @@ function createApp(db, opts = {}) {
   app.get('/api/recurring', async (c) => {
     await processRecurring();
     const rows = await db.all(`
-      SELECT r.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color
-      FROM recurring r JOIN categories c ON c.id = r.category_id
+      SELECT r.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color,
+             a.name AS account_name, a.icon AS account_icon, a.color AS account_color
+      FROM recurring r
+      JOIN categories c ON c.id = r.category_id
+      LEFT JOIN accounts a ON a.id = r.account_id
       ORDER BY r.active DESC, r.next_date`);
     return c.json(rows);
   });
@@ -660,6 +976,17 @@ function createApp(db, opts = {}) {
       if (!METHODS.some(x => x.id === m)) return { error: 'Invalid payment method' };
       out.method = m;
     }
+    if (b.account_id !== undefined || !existing) {
+      const raw = b.account_id ?? existing?.account_id ?? null;
+      if (raw === null || raw === '' || raw === 0) {
+        out.account_id = null;
+      } else {
+        const acc = await getAccount(Number(raw));
+        if (!acc) return { error: 'Account not found' };
+        out.account_id = acc.id;
+        if (b.method === undefined) out.method = accountMethod(acc);
+      }
+    }
     if (b.note !== undefined || !existing) {
       const note = b.note ?? existing?.note ?? '';
       if (typeof note !== 'string' || note.length > 500) return { error: 'Note must be 500 characters or fewer' };
@@ -674,9 +1001,9 @@ function createApp(db, opts = {}) {
     if (v.error) return c.json({ error: v.error }, 400);
     const x = v.value;
     const info = await db.run(`
-      INSERT INTO recurring (type, amount, category_id, note, method, frequency, next_date, active)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [x.type, x.amount, x.category_id, x.note || '', x.method, x.frequency, x.next_date, x.active ?? 1]);
+      INSERT INTO recurring (type, amount, category_id, note, method, frequency, next_date, active, account_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [x.type, x.amount, x.category_id, x.note || '', x.method, x.frequency, x.next_date, x.active ?? 1, x.account_id ?? null]);
     return c.json(await db.get('SELECT * FROM recurring WHERE id = ?', [info.lastInsertRowid]), 201);
   });
 
@@ -688,9 +1015,9 @@ function createApp(db, opts = {}) {
     if (v.error) return c.json({ error: v.error }, 400);
     const x = { ...existing, ...v.value };
     await db.run(`
-      UPDATE recurring SET type = ?, amount = ?, category_id = ?, note = ?, method = ?, frequency = ?, next_date = ?, active = ?
+      UPDATE recurring SET type = ?, amount = ?, category_id = ?, note = ?, method = ?, frequency = ?, next_date = ?, active = ?, account_id = ?
       WHERE id = ?`,
-      [x.type, x.amount, x.category_id, x.note, x.method, x.frequency, x.next_date, x.active, id]);
+      [x.type, x.amount, x.category_id, x.note, x.method, x.frequency, x.next_date, x.active, x.account_id ?? null, id]);
     return c.json(await db.get('SELECT * FROM recurring WHERE id = ?', [id]));
   });
 
@@ -752,14 +1079,24 @@ function createApp(db, opts = {}) {
     const projected = month === currentMonthKey() ? await SmartEngine.weekdayForecast(month) : null;
 
     const recent = await db.all(`
-      SELECT t.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color
-      FROM transactions t JOIN categories c ON c.id = t.category_id
+      SELECT t.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color,
+             a.name AS account_name, a.icon AS account_icon, a.color AS account_color
+      FROM transactions t
+      JOIN categories c ON c.id = t.category_id
+      LEFT JOIN accounts a ON a.id = t.account_id
       ORDER BY t.date DESC, t.id DESC LIMIT 8`);
+
+    const accounts = await accountBalances();
+    const unassigned = await unassignedTotals();
+    const totalBalance = accounts.reduce((s, a) => s + a.balance, 0) + unassigned.net;
+    const assets = accounts.reduce((s, a) => s + Math.max(a.balance, 0), 0) + Math.max(unassigned.net, 0);
+    const liabilities = accounts.reduce((s, a) => s + Math.max(-a.balance, 0), 0) + Math.max(-unassigned.net, 0);
 
     return c.json({
       month, days,
       monthTotals, prevTotals, allTime,
       byCategory, daily, trend, budgets, projected, recent,
+      accounts, unassigned, totalBalance, assets, liabilities,
       savingsRate: monthTotals.income > 0 ? (monthTotals.income - monthTotals.expense) / monthTotals.income : null,
     });
   });
@@ -833,11 +1170,13 @@ function createApp(db, opts = {}) {
   async function exportJson() {
     return {
       app: 'expense-tracker',
-      version: 1,
+      version: 2,
       exported_at: new Date().toISOString(),
       settings: { currency: await getSetting('currency', 'INR'), theme: await getSetting('theme', 'system') },
+      accounts: await db.all('SELECT * FROM accounts ORDER BY id'),
       categories: await db.all('SELECT * FROM categories ORDER BY id'),
       transactions: await db.all('SELECT * FROM transactions ORDER BY id'),
+      transfers: await db.all('SELECT * FROM transfers ORDER BY id'),
       budgets: await db.all('SELECT * FROM budgets ORDER BY id'),
       recurring: await db.all('SELECT * FROM recurring ORDER BY id'),
     };
@@ -847,16 +1186,18 @@ function createApp(db, opts = {}) {
     const format = c.req.query('format') === 'csv' ? 'csv' : 'json';
     if (format === 'csv') {
       const rows = await db.all(`
-        SELECT t.id, t.date, t.type, c.name AS category, t.amount, t.method, t.note, t.recurring_id, t.tags
-        FROM transactions t JOIN categories c ON c.id = t.category_id
+        SELECT t.id, t.date, t.type, c.name AS category, t.amount, t.method, a.name AS account, t.note, t.recurring_id, t.tags
+        FROM transactions t
+        JOIN categories c ON c.id = t.category_id
+        LEFT JOIN accounts a ON a.id = t.account_id
         ORDER BY t.date DESC, t.id DESC`);
-      const header = ['id', 'date', 'type', 'category', 'amount', 'method', 'note', 'recurring_id', 'tags'];
+      const header = ['id', 'date', 'type', 'category', 'amount', 'method', 'account', 'note', 'recurring_id', 'tags'];
       const escCsv = v => {
         const s = v === null || v === undefined ? '' : String(v);
         return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
       };
       const lines = [header.join(',')];
-      for (const r of rows) lines.push([r.id, r.date, r.type, r.category, r.amount, r.method, r.note, r.recurring_id ?? '', r.tags ?? ''].map(escCsv).join(','));
+      for (const r of rows) lines.push([r.id, r.date, r.type, r.category, r.amount, r.method, r.account ?? '', r.note, r.recurring_id ?? '', r.tags ?? ''].map(escCsv).join(','));
       const csv = '\uFEFF' + lines.join('\r\n');
       return c.body(csv, 200, {
         'Content-Type': 'text/csv; charset=utf-8',
@@ -875,18 +1216,37 @@ function createApp(db, opts = {}) {
       return c.json({ error: 'Not a valid backup file (expected JSON export from this app)' }, 400);
     }
     const catIds = new Set(data.categories.map(x => Number(x.id)).filter(Number.isInteger));
+    const hasAccounts = Array.isArray(data.accounts);
+    const accountRows = hasAccounts ? data.accounts.filter(x =>
+      Number.isInteger(Number(x.id)) && String(x.name || '').trim() && ACCOUNT_TYPE_MAP[x.type]) : [];
+    const accIds = new Set(accountRows.map(x => Number(x.id)));
     const txOk = data.transactions.every(t =>
       Number.isInteger(Number(t.id)) && validAmount(t.amount) &&
-      (t.type === 'income' || t.type === 'expense') && validDate(t.date) && catIds.has(Number(t.category_id)));
+      (t.type === 'income' || t.type === 'expense') && validDate(t.date) && catIds.has(Number(t.category_id)) &&
+      (t.account_id == null || !hasAccounts || accIds.has(Number(t.account_id))));
     if (!txOk) return c.json({ error: 'Backup contains invalid transactions' }, 400);
 
     try {
       const stmts = [
+        { sql: 'DELETE FROM transfers' },
         { sql: 'DELETE FROM transactions' },
         { sql: 'DELETE FROM budgets' },
         { sql: 'DELETE FROM recurring' },
         { sql: 'DELETE FROM categories' },
       ];
+      if (hasAccounts) stmts.push({ sql: 'DELETE FROM accounts' });
+
+      for (const a of accountRows) {
+        stmts.push({
+          sql: 'INSERT INTO accounts (id, name, type, opening_balance, icon, color, archived) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          params: [Number(a.id), String(a.name).slice(0, 40), a.type,
+            isFinite(Number(a.opening_balance)) ? Number(a.opening_balance) : 0,
+            String(a.icon || ACCOUNT_TYPE_MAP[a.type].icon).slice(0, 8),
+            /^#[0-9a-fA-F]{6}$/.test(String(a.color)) ? a.color : ACCOUNT_TYPE_MAP[a.type].color,
+            a.archived ? 1 : 0],
+        });
+      }
+
       for (const x of data.categories) {
         if (!(x.type === 'income' || x.type === 'expense')) throw new Error('Invalid category type');
         stmts.push({
@@ -898,12 +1258,13 @@ function createApp(db, opts = {}) {
       for (const t of data.transactions) {
         const tags = String(t.tags || '').split(',')
           .map(x => x.trim().toLowerCase()).filter(Boolean).slice(0, 10).map(x => x.slice(0, 24));
+        const accountId = t.account_id != null && accIds.has(Number(t.account_id)) ? Number(t.account_id) : null;
         stmts.push({
-          sql: 'INSERT INTO transactions (id, type, amount, category_id, date, note, method, recurring_id, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+          sql: 'INSERT INTO transactions (id, type, amount, category_id, date, note, method, recurring_id, tags, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
           params: [Number(t.id), t.type, Number(t.amount), Number(t.category_id), t.date,
             String(t.note || '').slice(0, 500), METHODS.some(m => m.id === t.method) ? t.method : 'cash',
             t.recurring_id != null && Number.isInteger(Number(t.recurring_id)) ? Number(t.recurring_id) : null,
-            [...new Set(tags)].join(',')],
+            [...new Set(tags)].join(','), accountId],
         });
       }
       if (Array.isArray(data.budgets)) {
@@ -920,17 +1281,31 @@ function createApp(db, opts = {}) {
         const freqs = ['daily', 'weekly', 'monthly', 'yearly'];
         for (const r of data.recurring) {
           if (validAmount(r.amount) && catIds.has(Number(r.category_id)) && validDate(r.next_date) && freqs.includes(r.frequency)) {
+            const accountId = r.account_id != null && accIds.has(Number(r.account_id)) ? Number(r.account_id) : null;
             stmts.push({
-              sql: 'INSERT INTO recurring (id, type, amount, category_id, note, method, frequency, next_date, active, last_run) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+              sql: 'INSERT INTO recurring (id, type, amount, category_id, note, method, frequency, next_date, active, last_run, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
               params: [Number(r.id), r.type === 'income' ? 'income' : 'expense', Number(r.amount), Number(r.category_id),
                 String(r.note || '').slice(0, 500), METHODS.some(m => m.id === r.method) ? r.method : 'cash',
-                r.frequency, r.next_date, r.active ? 1 : 0, r.last_run || null],
+                r.frequency, r.next_date, r.active ? 1 : 0, r.last_run || null, accountId],
+            });
+          }
+        }
+      }
+      if (Array.isArray(data.transfers)) {
+        for (const tr of data.transfers) {
+          if (validAmount(tr.amount) && validDate(tr.date) &&
+              accIds.has(Number(tr.from_account_id)) && accIds.has(Number(tr.to_account_id)) &&
+              Number(tr.from_account_id) !== Number(tr.to_account_id)) {
+            stmts.push({
+              sql: 'INSERT INTO transfers (id, from_account_id, to_account_id, amount, date, note) VALUES (?, ?, ?, ?, ?, ?)',
+              params: [Number(tr.id), Number(tr.from_account_id), Number(tr.to_account_id), Number(tr.amount), tr.date,
+                String(tr.note || '').slice(0, 500)],
             });
           }
         }
       }
       await db.batch(stmts);
-      try { await db.exec("DELETE FROM sqlite_sequence WHERE name IN ('categories','transactions','budgets','recurring')"); } catch { /* not available everywhere */ }
+      try { await db.exec("DELETE FROM sqlite_sequence WHERE name IN ('accounts','categories','transactions','transfers','budgets','recurring')"); } catch { /* not available everywhere */ }
       SmartEngine.invalidatePatterns();
     } catch (err) {
       return c.json({ error: 'Import failed: ' + err.message }, 400);
@@ -940,6 +1315,164 @@ function createApp(db, opts = {}) {
       if (['system', 'light', 'dark'].includes(data.settings.theme)) await setSetting('theme', data.settings.theme);
     }
     return c.json({ ok: true, transactions: data.transactions.length });
+  });
+
+  /* ---- CSV bank statement import ---- */
+  function csvField(row, headers, mapping, field) {
+    const key = mapping && mapping[field];
+    if (key === undefined || key === null || key === '') return '';
+    let idx = headers.findIndex(h => h.toLowerCase() === String(key).toLowerCase());
+    if (idx < 0 && Number.isInteger(Number(key))) idx = Number(key);
+    return idx >= 0 && idx < row.length ? String(row[idx]).trim() : '';
+  }
+
+  app.post('/api/import/csv/preview', async (c) => {
+    const { csv } = await readJson(c);
+    if (typeof csv !== 'string' || !csv.trim()) return c.json({ error: 'Choose a CSV file first' }, 400);
+    if (csv.length > 5 * 1024 * 1024) return c.json({ error: 'CSV is too large (max 5 MB)' }, 413);
+    const rows = parseCsv(csv);
+    if (rows.length < 2) return c.json({ error: 'CSV needs a header row and at least one data row' }, 400);
+    const headers = rows[0].map(normalizeHeader);
+    return c.json({ headers, total: rows.length - 1, preview: rows.slice(1, 11) });
+  });
+
+  app.post('/api/import/csv', async (c) => {
+    const body = await readJson(c);
+    const csv = body.csv;
+    if (typeof csv !== 'string' || !csv.trim()) return c.json({ error: 'Choose a CSV file first' }, 400);
+    if (csv.length > 5 * 1024 * 1024) return c.json({ error: 'CSV is too large (max 5 MB)' }, 413);
+
+    const rows = parseCsv(csv);
+    if (rows.length < 2) return c.json({ error: 'CSV needs a header row and at least one data row' }, 400);
+    if (rows.length - 1 > 5000) return c.json({ error: 'Too many rows (max 5000 per import). Split the file and try again.' }, 400);
+
+    const headers = rows[0].map(normalizeHeader);
+    const mapping = body.mapping && typeof body.mapping === 'object' ? body.mapping : {};
+    if (!mapping.date) return c.json({ error: 'Map the date column' }, 400);
+    if (!mapping.amount && !mapping.debit && !mapping.credit) {
+      return c.json({ error: 'Map an amount column (or debit/credit columns)' }, 400);
+    }
+
+    let account = null;
+    if (body.account_id !== undefined && body.account_id !== null && body.account_id !== '') {
+      account = await getAccount(Number(body.account_id));
+      if (!account) return c.json({ error: 'Account not found' }, 400);
+    }
+
+    const defaultType = body.default_type === 'income' ? 'income' : 'expense';
+    const invert = !!body.invert_amount;
+    const skipDuplicates = body.skip_duplicates !== false;
+    const method = account ? accountMethod(account) : 'other';
+    const tags = String(body.tags || '').split(',')
+      .map(t => t.trim().toLowerCase()).filter(Boolean).slice(0, 10).map(t => t.slice(0, 24));
+
+    const cats = await db.all('SELECT id, name, type FROM categories');
+    const catByName = new Map(cats.map(x => [x.name.toLowerCase(), x]));
+    const fallbackCat = type => cats.find(x => x.type === type && (type === 'expense' ? x.name === 'Others' : x.name === 'Other Income'));
+    // Load the Smart Engine's matching data once, then classify in memory so a
+    // big import doesn't issue one query per row (D1 free plan: 50 queries per
+    // Worker invocation).
+    const smartCtx = await SmartEngine.buildContext();
+
+    const parsed = [];
+    const errors = [];
+    let skipped = 0;
+
+    for (let i = 1; i < rows.length; i++) {
+      const row = rows[i];
+      const line = i + 1;
+      const date = parseCsvDate(csvField(row, headers, mapping, 'date'));
+      if (!date) { errors.push(`Line ${line}: could not read the date`); continue; }
+
+      let amount = null;
+      let type = null;
+      if (mapping.debit || mapping.credit) {
+        const debit = parseCsvAmount(csvField(row, headers, mapping, 'debit'));
+        const credit = parseCsvAmount(csvField(row, headers, mapping, 'credit'));
+        if (credit && credit > 0) { amount = Math.abs(credit); type = 'income'; }
+        else if (debit && debit > 0) { amount = Math.abs(debit); type = 'expense'; }
+      } else {
+        amount = parseCsvAmount(csvField(row, headers, mapping, 'amount'));
+        if (amount !== null && invert) amount = -amount;
+        if (amount !== null && amount !== 0) {
+          if (amount < 0) { type = 'expense'; amount = Math.abs(amount); }
+          else {
+            const hint = csvField(row, headers, mapping, 'type');
+            if (/credit|cr\b|income|deposit/i.test(hint)) type = 'income';
+            else if (/debit|dr\b|expense|withdraw/i.test(hint)) type = 'expense';
+            else type = defaultType;
+          }
+        }
+      }
+
+      if (amount === null || !isFinite(amount) || amount <= 0) {
+        errors.push(`Line ${line}: could not read the amount`);
+        continue;
+      }
+      if (amount >= 1e13) { errors.push(`Line ${line}: amount is too large`); continue; }
+
+      const note = [csvField(row, headers, mapping, 'description'), csvField(row, headers, mapping, 'reference')]
+        .filter(Boolean).join(' · ').slice(0, 500);
+
+      let categoryId = null;
+      const catName = csvField(row, headers, mapping, 'category');
+      if (catName) {
+        const match = catByName.get(catName.toLowerCase());
+        if (match && match.type === type) categoryId = match.id;
+      }
+      if (categoryId == null) {
+        try {
+          const s = SmartEngine.suggestFromContext(smartCtx, { type, note, amount });
+          if (s && s.category_id) {
+            const sc = cats.find(x => x.id === Number(s.category_id));
+            if (sc && sc.type === type) categoryId = sc.id;
+          }
+        } catch { /* fall through to the default category */ }
+      }
+      if (categoryId == null) {
+        const fb = fallbackCat(type);
+        if (fb) categoryId = fb.id;
+      }
+      if (categoryId == null) { errors.push(`Line ${line}: no matching category`); continue; }
+
+      const rounded = Math.round(amount * 100) / 100;
+      const key = `${date}|${rounded.toFixed(2)}|${type}|${account ? account.id : ''}|${note.toLowerCase()}`;
+      parsed.push({ date, amount: rounded, type, note, categoryId, key });
+    }
+
+    let toInsert = parsed;
+    if (skipDuplicates && parsed.length) {
+      const dates = parsed.map(p => p.date).sort();
+      const existing = await db.all(
+        'SELECT date, amount, type, account_id, note FROM transactions WHERE date >= ? AND date <= ?',
+        [dates[0], dates[dates.length - 1]]);
+      const existingKeys = new Set(existing.map(r =>
+        `${r.date}|${Number(r.amount).toFixed(2)}|${r.type}|${r.account_id ?? ''}|${String(r.note || '').toLowerCase()}`));
+      const seen = new Set();
+      toInsert = [];
+      for (const p of parsed) {
+        if (existingKeys.has(p.key) || seen.has(p.key)) { skipped++; continue; }
+        seen.add(p.key);
+        toInsert.push(p);
+      }
+    }
+
+    if (toInsert.length) {
+      await db.batch(toInsert.map(p => ({
+        sql: 'INSERT INTO transactions (type, amount, category_id, date, note, method, tags, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        params: [p.type, p.amount, p.categoryId, p.date, p.note, method, [...new Set(tags)].join(','), account ? account.id : null],
+      })));
+      SmartEngine.invalidatePatterns();
+    }
+
+    return c.json({
+      ok: true,
+      total: rows.length - 1,
+      inserted: toInsert.length,
+      skipped,
+      failed: errors.length,
+      errors: errors.slice(0, 20),
+    });
   });
 
   app.post('/api/sample-data', async (c) => {
@@ -974,12 +1507,30 @@ function createApp(db, opts = {}) {
     };
 
     const stmts = [];
+    const accountRows = await db.all('SELECT * FROM accounts');
+    const accByType = t => (accountRows.find(a => a.type === t) || {}).id ?? null;
+    const cashId = accByType('cash');
+    const bankId = accByType('bank');
+    let cardId = accByType('credit_card');
+    if (cardId == null) {
+      const info = await db.run("INSERT INTO accounts (name, type, opening_balance, icon, color) VALUES ('Credit Card', 'credit_card', 0, '💳', '#D63057')");
+      cardId = info.lastInsertRowid;
+    }
+    const methodAccount = method => {
+      if (method === 'card') return cardId;
+      if (method === 'cash' || method === 'wallet') return cashId;
+      return bankId;
+    };
+    // Give the demo a realistic starting point (only when the account is empty).
+    if (bankId != null) stmts.push({ sql: 'UPDATE accounts SET opening_balance = 25000 WHERE id = ? AND opening_balance = 0', params: [bankId] });
+    if (cashId != null) stmts.push({ sql: 'UPDATE accounts SET opening_balance = 2500 WHERE id = ? AND opening_balance = 0', params: [cashId] });
+
     const ins = (type, amount, catName, ds, note, method, tags) => {
       const cid = catId(catName);
       if (cid == null) return;
       stmts.push({
-        sql: 'INSERT INTO transactions (type, amount, category_id, date, note, method, tags) VALUES (?, ?, ?, ?, ?, ?, ?)',
-        params: [type, amount, cid, ds, note, method, tags],
+        sql: 'INSERT INTO transactions (type, amount, category_id, date, note, method, tags, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        params: [type, amount, cid, ds, note, method, tags, methodAccount(method)],
       });
     };
 
@@ -1027,12 +1578,12 @@ function createApp(db, opts = {}) {
     const next1st = advanceDate(`${today.getFullYear()}-${pad2(today.getMonth() + 1)}-01`, 'monthly');
     const next3rd = advanceDate(`${today.getFullYear()}-${pad2(today.getMonth() + 1)}-03`, 'monthly');
     if (catId('Salary') != null) stmts.push({
-      sql: 'INSERT INTO recurring (type, amount, category_id, note, method, frequency, next_date, active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
-      params: ['income', 65000, catId('Salary'), 'Monthly salary', 'netbanking', 'monthly', next1st],
+      sql: 'INSERT INTO recurring (type, amount, category_id, note, method, frequency, next_date, active, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)',
+      params: ['income', 65000, catId('Salary'), 'Monthly salary', 'netbanking', 'monthly', next1st, bankId],
     });
     if (catId('Rent') != null) stmts.push({
-      sql: 'INSERT INTO recurring (type, amount, category_id, note, method, frequency, next_date, active) VALUES (?, ?, ?, ?, ?, ?, ?, 1)',
-      params: ['expense', 16000, catId('Rent'), 'Rent', 'netbanking', 'monthly', next3rd],
+      sql: 'INSERT INTO recurring (type, amount, category_id, note, method, frequency, next_date, active, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)',
+      params: ['expense', 16000, catId('Rent'), 'Rent', 'netbanking', 'monthly', next3rd, bankId],
     });
 
     await db.batch(stmts);
@@ -1042,7 +1593,12 @@ function createApp(db, opts = {}) {
 
   app.delete('/api/data', async (c) => {
     if (c.req.query('confirm') !== 'DELETE') return c.json({ error: 'Pass ?confirm=DELETE to confirm' }, 400);
-    await db.batch([{ sql: 'DELETE FROM transactions' }, { sql: 'DELETE FROM budgets' }, { sql: 'DELETE FROM recurring' }]);
+    await db.batch([
+      { sql: 'DELETE FROM transfers' },
+      { sql: 'DELETE FROM transactions' },
+      { sql: 'DELETE FROM budgets' },
+      { sql: 'DELETE FROM recurring' },
+    ]);
     SmartEngine.invalidatePatterns();
     return c.json({ ok: true });
   });
@@ -1061,4 +1617,4 @@ function createApp(db, opts = {}) {
   return app;
 }
 
-module.exports = { createApp, ensureSchema, CURRENCIES, METHODS };
+module.exports = { createApp, ensureSchema, CURRENCIES, METHODS, ACCOUNT_TYPES };
