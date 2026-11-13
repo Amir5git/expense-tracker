@@ -79,6 +79,9 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 - Search, filter (type/category/**account**/date range/**tag**), and sort
   (date/amount)
 - Infinite scroll with date grouping and per-day totals
+- **Bulk actions** — switch to Select mode, then delete, recategorize or
+  add/remove tags on many transactions at once; deletes (single or bulk) show
+  an **Undo** toast
 
 **Accounts & net worth**
 - Multiple accounts: **cash, bank, credit card, wallet, UPI, investment,
@@ -157,6 +160,9 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 - Pause/resume rules
 
 **Settings & data**
+- **App lock** — optional passphrase gate for the public URL (PBKDF2-hashed,
+  HttpOnly signed session cookie, 30-day devices, per-IP login rate limit);
+  change or turn it off from Settings with the current passphrase
 - 20 currencies (INR default) — switch anytime; insight text follows the
   active currency
 - Light / dark / system theme
@@ -173,6 +179,8 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
   with Accounts and Settings shortcuts in the top-right
 - Smooth, reduced-motion-aware animations, a liquid bottom-nav indicator,
   tap ripples, and pill-shaped controls
+- Mobile gestures: swipe left/right between bottom-nav tabs, pull down at the
+  top to refresh, drag a bottom sheet down by its handle to dismiss
 - Installable PWA with offline app shell (data needs the server)
 - Keyboard shortcuts: `N` new transaction, `/` search
 - Mobile bottom-sheet modals, desktop dialogs
@@ -263,6 +271,29 @@ of this. To enable chat + natural-language quick add:
 
 The key is stored in the server's SQLite settings table and is never sent to
 the browser. All AI calls are proxied server-side with a 45s timeout.
+
+## App lock (optional)
+
+The deployed URL is public by default. **Settings → App lock** lets you set a
+passphrase so every device must unlock before any data is served:
+
+- The passphrase is stored as a **PBKDF2-SHA256** hash (15,000 iterations) —
+  never in plain text.
+- A successful unlock sets an **HttpOnly, HMAC-signed** session cookie that
+  lasts 30 days on that device (`SameSite=Lax`, `Secure` on HTTPS).
+- Login attempts are rate-limited to **8 per 10 minutes per IP**; AI endpoints
+  are capped at 30 requests per minute per IP.
+- Changing or turning the lock off requires the current passphrase.
+- There is **no recovery** — if you forget it, reset the lock from the
+  database (this does not touch your transactions):
+
+  ```bash
+  # Local (Node + SQLite)
+  npm run auth:reset
+
+  # Cloudflare D1 (remote)
+  npx wrangler d1 execute expense-tracker --remote --command "DELETE FROM settings WHERE key IN ('auth_hash','auth_secret')"
+  ```
 
 ## Deployment
 

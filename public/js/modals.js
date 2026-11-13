@@ -50,7 +50,52 @@ function openModal(html, { onMount, onClose } = {}) {
   overlay.addEventListener('click', e => { if (e.target === overlay) entry.close(false); });
   overlay.querySelectorAll('[data-close]').forEach(b => b.addEventListener('click', () => entry.close(false)));
   if (onMount) onMount(modal, entry.close);
+  setupSheetDrag(modal, entry.close);
   return entry.close;
+}
+
+/* Drag the mobile bottom sheet down by its header to dismiss it. */
+function setupSheetDrag(modal, close) {
+  if (!modal || prefersReducedMotion()) return;
+  if (!window.matchMedia('(max-width: 639px)').matches) return;
+  const head = modal.querySelector('.modal-head');
+  if (!head) return;
+
+  let startY = 0, startX = 0, dy = 0, dragging = false;
+
+  head.addEventListener('pointerdown', e => {
+    if (e.pointerType === 'mouse') return;
+    dragging = true;
+    startY = e.clientY;
+    startX = e.clientX;
+    dy = 0;
+    modal.classList.add('dragging');
+    try { head.setPointerCapture(e.pointerId); } catch { /* ignore */ }
+  });
+
+  head.addEventListener('pointermove', e => {
+    if (!dragging) return;
+    const dx = Math.abs(e.clientX - startX);
+    dy = Math.max(0, e.clientY - startY);
+    if (dx > dy && dx > 20) return; // horizontal intent: don't lift the sheet
+    modal.style.transform = `translateY(${dy}px)`;
+  });
+
+  const finish = () => {
+    if (!dragging) return;
+    dragging = false;
+    modal.classList.remove('dragging');
+    const height = modal.getBoundingClientRect().height;
+    const shouldClose = dy > Math.min(140, height * 0.3);
+    modal.style.transition = 'transform 0.22s cubic-bezier(0.22, 1, 0.36, 1)';
+    modal.style.transform = '';
+    setTimeout(() => { modal.style.transition = ''; }, 240);
+    dy = 0;
+    if (shouldClose) close(false);
+  };
+
+  head.addEventListener('pointerup', finish);
+  head.addEventListener('pointercancel', finish);
 }
 
 document.addEventListener('keydown', e => {
@@ -59,15 +104,35 @@ document.addEventListener('keydown', e => {
 
 /* ---------- toast ---------- */
 
-function showToast(msg, type = 'info') {
+function showToast(msg, type = 'info', { action, onAction, duration } = {}) {
   const t = document.createElement('div');
-  t.className = 'toast' + (type === 'error' ? ' error' : '');
-  t.textContent = msg;
-  $('#toastRoot').appendChild(t);
-  setTimeout(() => {
+  t.className = 'toast' + (type === 'error' ? ' error' : '') + (action ? ' has-action' : '');
+  const text = document.createElement('span');
+  text.className = 'toast-msg';
+  text.textContent = msg;
+  t.appendChild(text);
+
+  let timer;
+  const dismiss = () => {
+    clearTimeout(timer);
     t.classList.add('out');
     setTimeout(() => t.remove(), 300);
-  }, 2400);
+  };
+
+  if (action) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'toast-action';
+    btn.textContent = action;
+    btn.addEventListener('click', () => {
+      dismiss();
+      if (onAction) onAction();
+    });
+    t.appendChild(btn);
+  }
+
+  $('#toastRoot').appendChild(t);
+  timer = setTimeout(dismiss, duration || (action ? 6000 : 2400));
 }
 
 /* ---------- confirm dialog ---------- */
@@ -279,11 +344,21 @@ function openTxModal(tx = null, prefill = null) {
 
       const delBtn = modal.querySelector('[data-del]');
       if (delBtn) delBtn.addEventListener('click', async () => {
-        const ok = await confirmDialog({ title: 'Delete transaction?', message: 'This cannot be undone.' });
+        const ok = await confirmDialog({ title: 'Delete transaction?', message: 'You can undo this right after.', confirmLabel: 'Delete' });
         if (!ok) return;
         try {
-          await api.del(`/api/transactions/${tx.id}`);
-          showToast('Transaction deleted');
+          const res = await api.del(`/api/transactions/${tx.id}`);
+          showToast('Transaction deleted', 'info', {
+            action: 'Undo',
+            duration: 7000,
+            onAction: async () => {
+              try {
+                await api.post('/api/transactions/bulk', { action: 'restore', rows: res && res.row ? [res.row] : [] });
+                showToast('Restored');
+                refreshView();
+              } catch (err) { showToast(err.message, 'error'); }
+            },
+          });
           closeModal(true);
           refreshView();
         } catch (err) { showToast(err.message, 'error'); }

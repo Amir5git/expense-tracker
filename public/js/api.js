@@ -19,6 +19,9 @@ const api = {
     let data = null;
     try { data = await res.json(); } catch { /* no body */ }
     if (!res.ok) {
+      if (res.status === 401 && data && data.code === 'auth_required' && typeof api.onAuthRequired === 'function') {
+        api.onAuthRequired();
+      }
       throw new Error((data && data.error) || `${res.status} ${res.statusText}`);
     }
     return data;
@@ -27,6 +30,9 @@ const api = {
   post: (url, body) => api.req('POST', url, body),
   put: (url, body) => api.req('PUT', url, body),
   del: url => api.req('DELETE', url),
+
+  /** Called when the server reports the session is locked/expired. */
+  onAuthRequired: null,
 
   qs(params) {
     const sp = new URLSearchParams();

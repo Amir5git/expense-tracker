@@ -228,6 +228,12 @@ function advanceDate(dateStr, frequency) {
 
 function escapeLike(s) { return String(s).replace(/[\\%_]/g, c => '\\' + c); }
 
+function chunkArray(arr, size) {
+  const out = [];
+  for (let i = 0; i < arr.length; i += size) out.push(arr.slice(i, i + size));
+  return out;
+}
+
 /* ------------------------------------------------------------------ */
 /* CSV helpers (bank statement import)                                 */
 /* ------------------------------------------------------------------ */
@@ -317,6 +323,112 @@ function normalizeHeader(h, index) {
 /* ------------------------------------------------------------------ */
 /* Schema init (idempotent, race-safe across isolates/processes)       */
 /* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+/* App lock (optional passphrase)                                      */
+/* ------------------------------------------------------------------ */
+
+const SESSION_COOKIE = 'et_session';
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const PBKDF2_ITERATIONS = 15000;
+const MIN_PASSPHRASE = 8;
+
+function b64urlEncode(bytes) {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64urlDecode(str) {
+  const s = String(str).replace(/-/g, '+').replace(/_/g, '/');
+  const bin = atob(s + '='.repeat((4 - (s.length % 4)) % 4));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function timingSafeEqual(a, b) {
+  const x = b64urlDecode(a);
+  const y = b64urlDecode(b);
+  if (!x.length || x.length !== y.length) return false;
+  let diff = 0;
+  for (let i = 0; i < x.length; i++) diff |= x[i] ^ y[i];
+  return diff === 0;
+}
+
+async function pbkdf2(passphrase, salt, iterations) {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(passphrase), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' }, key, 256);
+  return new Uint8Array(bits);
+}
+
+async function hashPassphrase(passphrase) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const hash = await pbkdf2(passphrase, salt, PBKDF2_ITERATIONS);
+  return `pbkdf2$${PBKDF2_ITERATIONS}$${b64urlEncode(salt)}$${b64urlEncode(hash)}`;
+}
+
+async function checkPassphrase(passphrase, stored) {
+  try {
+    const [scheme, iter, salt, hash] = String(stored || '').split('$');
+    if (scheme !== 'pbkdf2' || !salt || !hash) return false;
+    const bits = await pbkdf2(String(passphrase || ''), b64urlDecode(salt), Number(iter) || PBKDF2_ITERATIONS);
+    return timingSafeEqual(b64urlEncode(bits), hash);
+  } catch {
+    return false;
+  }
+}
+
+async function signSession(secret, expires) {
+  const key = await crypto.subtle.importKey(
+    'raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`v1.${expires}`));
+  return b64urlEncode(new Uint8Array(sig));
+}
+
+function cookieValue(c, name) {
+  const raw = c.req.header('cookie') || '';
+  for (const part of raw.split(';')) {
+    const i = part.indexOf('=');
+    if (i < 0) continue;
+    if (part.slice(0, i).trim() !== name) continue;
+    try { return decodeURIComponent(part.slice(i + 1).trim()); } catch { return ''; }
+  }
+  return '';
+}
+
+function requestIsHttps(c) {
+  const proto = c.req.header('x-forwarded-proto');
+  if (proto) return proto.split(',')[0].trim() === 'https';
+  return /^https:/i.test(c.req.url);
+}
+
+function clientIp(c) {
+  return (c.req.header('cf-connecting-ip')
+    || c.req.header('x-real-ip')
+    || (c.req.header('x-forwarded-for') || '').split(',')[0].trim()
+    || 'local');
+}
+
+/* Fixed-window counters, per isolate. Enough to blunt passphrase guessing
+   and runaway AI usage on a personal app without another table. */
+const rateBuckets = new Map();
+
+function rateLimit(key, limit, windowMs) {
+  const now = Date.now();
+  const bucket = rateBuckets.get(key);
+  if (!bucket || bucket.reset <= now) {
+    rateBuckets.set(key, { count: 1, reset: now + windowMs });
+    return { ok: true };
+  }
+  bucket.count++;
+  if (rateBuckets.size > 2000) {
+    for (const [k, v] of rateBuckets) if (v.reset <= now) rateBuckets.delete(k);
+  }
+  return { ok: bucket.count <= limit };
+}
 
 async function ensureSchema(db) {
   // On a brand-new database the settings table doesn't exist yet — treat that
@@ -493,6 +605,113 @@ function createApp(db, opts = {}) {
       throw err;
     }
   }
+
+  /* ---- app lock helpers ---- */
+
+  const authEnabled = async () => !!(await getSetting('auth_hash', ''));
+
+  async function sessionValid(c) {
+    const secret = await getSetting('auth_secret', '');
+    const token = cookieValue(c, SESSION_COOKIE);
+    if (!secret || !token) return false;
+    const dot = token.indexOf('.');
+    if (dot < 1) return false;
+    const expires = Number(token.slice(0, dot));
+    if (!Number.isFinite(expires) || expires < Date.now()) return false;
+    const expected = await signSession(secret, expires);
+    return timingSafeEqual(token.slice(dot + 1), expected);
+  }
+
+  async function startSession(c) {
+    const secret = await getSetting('auth_secret', '');
+    const expires = Date.now() + SESSION_TTL_MS;
+    const signature = await signSession(secret, expires);
+    const parts = [
+      `${SESSION_COOKIE}=${encodeURIComponent(`${expires}.${signature}`)}`,
+      'Path=/', 'HttpOnly', 'SameSite=Lax', `Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`,
+    ];
+    if (requestIsHttps(c)) parts.push('Secure');
+    c.header('Set-Cookie', parts.join('; '));
+  }
+
+  function clearSession(c) {
+    const parts = [`${SESSION_COOKIE}=`, 'Path=/', 'HttpOnly', 'SameSite=Lax', 'Max-Age=0'];
+    if (requestIsHttps(c)) parts.push('Secure');
+    c.header('Set-Cookie', parts.join('; '));
+  }
+
+  /* AI calls cost tokens (and money on paid keys), so cap them per client. */
+  function aiRateLimited(c) {
+    return !rateLimit(`ai:${clientIp(c)}`, 30, 60 * 1000).ok;
+  }
+
+  /* Every API route except the lock screen's own endpoints is protected
+     once a passphrase is set. Static files stay public so the shell can
+     load and ask for the passphrase. */
+  app.use('/api/*', async (c, next) => {
+    const path = c.req.path;
+    if (path === '/api/health' || path === '/api/auth/status' || path === '/api/auth/login') return next();
+    if (!(await authEnabled())) return next();
+    if (await sessionValid(c)) return next();
+    return c.json({ error: 'Locked. Enter your passphrase to continue.', code: 'auth_required' }, 401);
+  });
+
+  /* ---- app lock routes ---- */
+
+  app.get('/api/auth/status', async (c) => {
+    const enabled = await authEnabled();
+    return c.json({ enabled, authed: !enabled || await sessionValid(c) });
+  });
+
+  app.post('/api/auth/login', async (c) => {
+    const ip = clientIp(c);
+    const limit = rateLimit(`login:${ip}`, 8, 10 * 60 * 1000);
+    if (!limit.ok) return c.json({ error: 'Too many attempts. Try again in a few minutes.' }, 429);
+
+    const { passphrase } = await readJson(c);
+    const stored = await getSetting('auth_hash', '');
+    if (!stored) return c.json({ ok: true, enabled: false });
+    if (!(await checkPassphrase(passphrase, stored))) {
+      return c.json({ error: 'Incorrect passphrase.' }, 401);
+    }
+    rateBuckets.delete(`login:${ip}`);
+    await startSession(c);
+    return c.json({ ok: true, enabled: true });
+  });
+
+  app.post('/api/auth/enable', async (c) => {
+    const { passphrase, current } = await readJson(c);
+    const stored = await getSetting('auth_hash', '');
+    if (stored && !(await checkPassphrase(current, stored))) {
+      return c.json({ error: 'Current passphrase is incorrect.' }, 401);
+    }
+    if (typeof passphrase !== 'string' || passphrase.length < MIN_PASSPHRASE || passphrase.length > 200) {
+      return c.json({ error: `Passphrase must be ${MIN_PASSPHRASE}–200 characters.` }, 400);
+    }
+    if (!(await getSetting('auth_secret', ''))) {
+      await setSetting('auth_secret', b64urlEncode(crypto.getRandomValues(new Uint8Array(32))));
+    }
+    await setSetting('auth_hash', await hashPassphrase(passphrase));
+    await startSession(c);
+    return c.json({ ok: true, enabled: true });
+  });
+
+  app.post('/api/auth/disable', async (c) => {
+    const { passphrase } = await readJson(c);
+    const stored = await getSetting('auth_hash', '');
+    if (stored && !(await checkPassphrase(passphrase, stored))) {
+      return c.json({ error: 'Incorrect passphrase.' }, 401);
+    }
+    await setSetting('auth_hash', '');
+    await setSetting('auth_secret', '');
+    clearSession(c);
+    return c.json({ ok: true, enabled: false });
+  });
+
+  app.post('/api/auth/logout', (c) => {
+    clearSession(c);
+    return c.json({ ok: true });
+  });
 
   /* ---- health ---- */
   app.get('/api/health', (c) => c.json({ ok: true, time: new Date().toISOString() }));
@@ -693,10 +912,115 @@ function createApp(db, opts = {}) {
   });
 
   app.delete('/api/transactions/:id', async (c) => {
-    const info = await db.run('DELETE FROM transactions WHERE id = ?', [Number(c.req.param('id'))]);
-    if (info.changes === 0) return c.json({ error: 'Transaction not found' }, 404);
+    const id = Number(c.req.param('id'));
+    const row = await db.get('SELECT * FROM transactions WHERE id = ?', [id]);
+    if (!row) return c.json({ error: 'Transaction not found' }, 404);
+    await db.run('DELETE FROM transactions WHERE id = ?', [id]);
     SmartEngine.invalidatePatterns();
-    return c.json({ ok: true });
+    return c.json({ ok: true, row });
+  });
+
+  /* Bulk select actions: delete (returns rows for undo), restore, and
+     category/account/tag updates. Ids are chunked to respect D1's bound
+     parameter limit on the free plan. */
+  app.post('/api/transactions/bulk', async (c) => {
+    const body = await readJson(c);
+    const action = body.action;
+    const ids = Array.isArray(body.ids)
+      ? [...new Set(body.ids.map(Number).filter(n => Number.isInteger(n) && n > 0))]
+      : [];
+    if (ids.length > 500) return c.json({ error: 'Select at most 500 transactions at once' }, 400);
+
+    const fetchRows = async () => {
+      const rows = [];
+      for (const chunk of chunkArray(ids, 90)) {
+        rows.push(...await db.all(
+          `SELECT * FROM transactions WHERE id IN (${chunk.map(() => '?').join(',')})`, chunk));
+      }
+      return rows;
+    };
+
+    if (action === 'delete') {
+      if (!ids.length) return c.json({ error: 'No transactions selected' }, 400);
+      const rows = await fetchRows();
+      if (rows.length) {
+        await db.batch(chunkArray(ids, 90).map(chunk => ({
+          sql: `DELETE FROM transactions WHERE id IN (${chunk.map(() => '?').join(',')})`,
+          params: chunk,
+        })));
+      }
+      SmartEngine.invalidatePatterns();
+      return c.json({ deleted: rows.length, rows });
+    }
+
+    if (action === 'restore') {
+      const rows = Array.isArray(body.rows) ? body.rows.slice(0, 500) : [];
+      const stmts = [];
+      for (const row of rows) {
+        const v = await validateTxBody(row);
+        if (v.error) continue;
+        const t = v.value;
+        stmts.push({
+          sql: 'INSERT INTO transactions (type, amount, category_id, date, note, method, tags, account_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+          params: [t.type, t.amount, t.category_id, t.date, t.note, t.method, t.tags || '', t.account_id ?? null],
+        });
+      }
+      if (stmts.length) await db.batch(stmts);
+      SmartEngine.invalidatePatterns();
+      return c.json({ restored: stmts.length });
+    }
+
+    if (action === 'update') {
+      if (!ids.length) return c.json({ error: 'No transactions selected' }, 400);
+      const patch = body.patch || {};
+      const rows = await fetchRows();
+      if (!rows.length) return c.json({ updated: 0 });
+
+      let category = null;
+      if (patch.category_id !== undefined) {
+        category = await getCategory(Number(patch.category_id));
+        if (!category) return c.json({ error: 'Category not found' }, 400);
+        if (rows.some(r => r.type !== category.type)) {
+          return c.json({ error: 'Category type does not match every selected transaction' }, 400);
+        }
+      }
+
+      let account = null;
+      const changeAccount = patch.account_id !== undefined;
+      if (changeAccount && patch.account_id !== null && patch.account_id !== '' && patch.account_id !== 0) {
+        account = await getAccount(Number(patch.account_id));
+        if (!account) return c.json({ error: 'Account not found' }, 400);
+      }
+
+      const addTags = String(patch.tags_add || '').split(',')
+        .map(s => s.trim().toLowerCase()).filter(Boolean);
+      const removeTags = new Set(String(patch.tags_remove || '').split(',')
+        .map(s => s.trim().toLowerCase()).filter(Boolean));
+
+      const stmts = rows.map(row => {
+        let tags = String(row.tags || '').split(',').filter(Boolean);
+        if (addTags.length || removeTags.size) {
+          tags = tags.filter(t => !removeTags.has(t));
+          for (const t of addTags) if (!tags.includes(t)) tags.push(t);
+          tags = tags.slice(0, 10).map(t => t.slice(0, 24));
+        }
+        return {
+          sql: 'UPDATE transactions SET category_id = ?, account_id = ?, method = ?, tags = ? WHERE id = ?',
+          params: [
+            category ? category.id : row.category_id,
+            changeAccount ? (account ? account.id : null) : row.account_id,
+            changeAccount ? (account ? accountMethod(account) : row.method) : row.method,
+            tags.join(','),
+            row.id,
+          ],
+        };
+      });
+      await db.batch(stmts);
+      SmartEngine.invalidatePatterns();
+      return c.json({ updated: stmts.length });
+    }
+
+    return c.json({ error: 'Unknown bulk action' }, 400);
   });
 
   /* ---- accounts ---- */
@@ -1138,6 +1462,7 @@ function createApp(db, opts = {}) {
   app.get('/api/ai/status', async (c) => c.json(await AILayer.status()));
 
   app.post('/api/ai/ask', async (c) => {
+    if (aiRateLimited(c)) return c.json({ error: 'Too many AI requests. Wait a minute and try again.' }, 429);
     const { question, month } = await readJson(c);
     if (!question || !String(question).trim()) return c.json({ error: 'Ask a question first' }, 400);
     const m = validMonth(month) ? month : currentMonthKey();
@@ -1149,6 +1474,7 @@ function createApp(db, opts = {}) {
   });
 
   app.post('/api/ai/parse', async (c) => {
+    if (aiRateLimited(c)) return c.json({ error: 'Too many AI requests. Wait a minute and try again.' }, 429);
     const { text } = await readJson(c);
     if (!text || !String(text).trim()) return c.json({ error: 'Enter some text first' }, 400);
     try {
@@ -1159,6 +1485,7 @@ function createApp(db, opts = {}) {
   });
 
   app.post('/api/ai/test', async (c) => {
+    if (aiRateLimited(c)) return c.json({ error: 'Too many AI requests. Wait a minute and try again.' }, 429);
     try {
       return c.json(await AILayer.test());
     } catch (err) {

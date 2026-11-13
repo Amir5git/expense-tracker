@@ -10,6 +10,7 @@
     "dev:cf": "npx wrangler dev",
     "deploy": "npx wrangler deploy",
     "tunnel": "npx cloudflared tunnel --url http://localhost:3000",
+    "auth:reset": "node scripts/reset-lock.js",
     "icons": "node scripts/gen-icons.js"
   },
   "engines": {

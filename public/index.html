@@ -23,6 +23,20 @@
   <link rel="stylesheet" href="/css/styles.css">
 </head>
 <body>
+  <!-- Passphrase lock (shown only when app lock is enabled) -->
+  <div id="lockScreen" class="lock-screen" hidden>
+    <form class="lock-card" id="lockForm">
+      <div class="lock-icon" aria-hidden="true">🔒</div>
+      <h1>Expense Tracker</h1>
+      <p class="lock-sub">Enter your passphrase to unlock</p>
+      <input class="input" id="lockPass" type="password" name="passphrase"
+        autocomplete="current-password" placeholder="Passphrase" required>
+      <div class="lock-error" id="lockError" role="alert"></div>
+      <button class="btn" id="lockBtn" type="submit">Unlock</button>
+      <button class="btn secondary lock-theme" id="lockThemeBtn" type="button">Toggle theme</button>
+    </form>
+  </div>
+
   <div id="app">
 
     <!-- Sidebar (desktop) -->
@@ -84,6 +98,7 @@
           <span class="theme-icon-moon">🌙</span><span class="theme-icon-sun">☀️</span>
         </button>
       </header>
+      <div id="pullHint" class="pull-hint" aria-live="polite">Pull to refresh</div>
       <main id="view" tabindex="-1"><div class="loading-block">Loading…</div></main>
     </div>
 
@@ -114,6 +129,28 @@
         <span>Repeat</span>
       </a>
     </nav>
+
+    <!-- Bulk selection bar (transactions) -->
+    <div id="txBulkBar" class="tx-bulk-bar" hidden>
+      <div class="tx-bulk-top">
+        <button class="tx-bulk-count" type="button" id="txBulkCount">0 selected</button>
+        <button class="tx-bulk-link" type="button" id="txBulkAll">Select all</button>
+      </div>
+      <div class="tx-bulk-actions">
+        <button class="tx-bulk-btn" type="button" id="txBulkCategory">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg>
+          <span>Category</span>
+        </button>
+        <button class="tx-bulk-btn" type="button" id="txBulkTag">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg>
+          <span>Tags</span>
+        </button>
+        <button class="tx-bulk-btn danger" type="button" id="txBulkDelete">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a2 2 0 0 1 2-2h2a2 2 0 0 1 2 2v2"/></svg>
+          <span>Delete</span>
+        </button>
+      </div>
+    </div>
 
     <button id="fab" type="button" aria-label="Add transaction" title="Add transaction (N)">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>

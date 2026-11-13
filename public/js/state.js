@@ -31,6 +31,8 @@ const State = {
   tx: {
     filters: { type: '', category: '', account: '', range: 'month', from: '', to: '', q: '', tag: '', sort: 'date_desc' },
     rows: [], total: 0, income: 0, expense: 0, loading: false, loadedAll: false,
+    selectMode: false,
+    selected: new Set(),
   },
 };
 

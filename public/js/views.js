@@ -11,6 +11,8 @@ function setViewActions(html) { $('#viewActions').innerHTML = html || ''; }
 
 function txRowHTML(tx, { showDate = false, showMethod = true } = {}) {
   const isIncome = tx.type === 'income';
+  const selecting = txSelectMode();
+  const checked = selecting && txSelection().has(Number(tx.id));
   const sub = [];
   if (tx.note) sub.push(esc(tx.category_name));
   if (showMethod) {
@@ -20,7 +22,8 @@ function txRowHTML(tx, { showDate = false, showMethod = true } = {}) {
   if (tx.recurring_id) sub.push('🔁 auto');
   if (showDate) sub.push(esc(shortDate(tx.date)));
   return `
-    <div class="tx-row" data-tx-id="${tx.id}" role="button" tabindex="0" title="Edit">
+    <div class="tx-row${selecting ? ' selectable' : ''}${checked ? ' selected' : ''}" data-tx-id="${tx.id}" role="button" tabindex="0" title="${selecting ? 'Select' : 'Edit'}">
+      ${selecting ? `<input class="tx-check" type="checkbox" data-tx-check="${tx.id}" ${checked ? 'checked' : ''} aria-label="Select transaction">` : ''}
       <div class="tx-icon" style="background:${esc(tx.category_color)}22">${esc(tx.category_icon || '📦')}</div>
       <div class="tx-main">
         <div class="tx-name">${esc(tx.note || tx.category_name)}</div>
@@ -31,15 +34,220 @@ function txRowHTML(tx, { showDate = false, showMethod = true } = {}) {
     </div>`;
 }
 
+function txSelection() {
+  if (!(State.tx.selected instanceof Set)) State.tx.selected = new Set();
+  return State.tx.selected;
+}
+function txSelectMode() { return !!State.tx.selectMode; }
+function txSelectedIds() { return [...txSelection()]; }
+
 function wireTxRows(root, rows) {
   $$('.tx-row', root).forEach(el => {
-    const open = () => {
+    const id = Number(el.dataset.txId);
+    const toggle = () => {
+      const sel = txSelection();
+      if (sel.has(id)) sel.delete(id); else sel.add(id);
+      updateTxSelectionUI();
+    };
+    el.addEventListener('click', e => {
+      if (txSelectMode()) {
+        if (e.target.closest('.tx-check')) return; // the checkbox handles itself
+        toggle();
+        return;
+      }
       const tx = rows.find(r => String(r.id) === el.dataset.txId);
       if (tx) openTxModal(tx);
-    };
-    el.addEventListener('click', open);
-    el.addEventListener('keydown', e => { if (e.key === 'Enter') open(); });
+    });
+    el.addEventListener('keydown', e => {
+      if (e.key !== 'Enter' && e.key !== ' ') return;
+      e.preventDefault();
+      if (txSelectMode()) { toggle(); return; }
+      const tx = rows.find(r => String(r.id) === el.dataset.txId);
+      if (tx) openTxModal(tx);
+    });
+    const check = $('.tx-check', el);
+    if (check) check.addEventListener('change', e => { e.stopPropagation(); toggle(); });
   });
+}
+
+/* ---------- bulk selection ---------- */
+
+function setTxSelectMode(on) {
+  State.tx.selectMode = !!on;
+  if (!on) txSelection().clear();
+  document.body.classList.toggle('tx-selecting', State.tx.selectMode);
+  renderTxActions();
+  if (State.view === 'transactions') {
+    const listEl = $('#txList');
+    if (listEl && State.tx.rows) {
+      const grouped = State.tx.filters.sort.startsWith('date');
+      listEl.innerHTML = txListHTML(State.tx.rows, { grouped, emptyLabel: filtersEmpty() });
+      wireTxRows(listEl, State.tx.rows);
+    }
+  }
+  updateTxSelectionUI();
+}
+
+function renderTxActions() {
+  if (txSelectMode()) {
+    setViewActions('<button class="btn secondary" data-tx-cancel>Cancel</button>');
+  } else {
+    setViewActions('<button class="btn secondary" data-tx-select>Select</button><button class="btn" data-add>+ Add</button>');
+  }
+  const selectBtn = $('#viewActions [data-tx-select]');
+  if (selectBtn) selectBtn.addEventListener('click', () => setTxSelectMode(true));
+  const cancelBtn = $('#viewActions [data-tx-cancel]');
+  if (cancelBtn) cancelBtn.addEventListener('click', () => setTxSelectMode(false));
+  $$('#viewActions [data-add]').forEach(b => b.addEventListener('click', () => openTxModal()));
+}
+
+function updateTxSelectionUI() {
+  const sel = txSelection();
+  const rows = $$('#txList .tx-row');
+  for (const el of rows) {
+    const id = Number(el.dataset.txId);
+    const on = sel.has(id);
+    el.classList.toggle('selected', on);
+    const check = $('.tx-check', el);
+    if (check) check.checked = on;
+  }
+  const bar = $('#txBulkBar');
+  if (!bar) return;
+  const show = txSelectMode();
+  bar.hidden = !show;
+  if (!show) return;
+  $('#txBulkCount').textContent = `${sel.size} selected`;
+  const all = rows.length > 0 && rows.every(el => sel.has(Number(el.dataset.txId)));
+  $('#txBulkAll').textContent = all ? 'Clear all' : 'Select all';
+  $('#txBulkCategory').disabled = sel.size === 0;
+  $('#txBulkTag').disabled = sel.size === 0;
+  $('#txBulkDelete').disabled = sel.size === 0;
+}
+
+function toggleSelectAllTx() {
+  const sel = txSelection();
+  const rows = $$('#txList .tx-row');
+  const all = rows.length > 0 && rows.every(el => sel.has(Number(el.dataset.txId)));
+  if (all) sel.clear();
+  else for (const el of rows) sel.add(Number(el.dataset.txId));
+  updateTxSelectionUI();
+}
+
+async function bulkTxUpdate(patch, successMessage) {
+  const ids = txSelectedIds();
+  if (!ids.length) return;
+  try {
+    const res = await api.post('/api/transactions/bulk', { action: 'update', ids, patch });
+    showToast(successMessage.replace('{n}', res.updated ?? ids.length));
+    await loadTx(true);
+    updateTxSelectionUI();
+  } catch (err) { showToast(err.message, 'error'); }
+}
+
+async function bulkTxDelete() {
+  const ids = txSelectedIds();
+  if (!ids.length) return;
+  const ok = await confirmDialog({
+    title: `Delete ${ids.length} transaction${ids.length === 1 ? '' : 's'}?`,
+    message: 'You can undo this right after.',
+    confirmLabel: 'Delete',
+  });
+  if (!ok) return;
+  try {
+    const res = await api.post('/api/transactions/bulk', { action: 'delete', ids });
+    const rows = res.rows || [];
+    showToast(`${res.deleted} deleted`, 'info', {
+      action: 'Undo',
+      duration: 7000,
+      onAction: async () => {
+        try {
+          await api.post('/api/transactions/bulk', { action: 'restore', rows });
+          showToast('Restored');
+          await loadTx(true);
+          updateTxSelectionUI();
+        } catch (err) { showToast(err.message, 'error'); }
+      },
+    });
+    setTxSelectMode(false);
+    await loadTx(true);
+  } catch (err) { showToast(err.message, 'error'); }
+}
+
+function openBulkCategoryModal() {
+  const ids = txSelectedIds();
+  if (!ids.length) return;
+  const selectedRows = State.tx.rows.filter(r => txSelection().has(Number(r.id)));
+  const types = new Set(selectedRows.map(r => r.type));
+  if (types.size > 1) return showToast('Select only expenses or only income', 'error');
+  const type = [...types][0] || 'expense';
+  const cats = State.categories.filter(c => c.type === type);
+
+  openModal(`
+    <div class="modal" style="max-width:440px">
+      <div class="modal-head"><h3>Change category</h3></div>
+      <div class="modal-body">
+        <p class="help-text" style="margin-top:0">${ids.length} transaction${ids.length === 1 ? '' : 's'} will be moved.</p>
+        <div class="cat-grid" data-role="bulk-cats">
+          ${cats.map(c => `<button type="button" class="cat-chip" data-cat-id="${c.id}">
+            <span class="cat-chip-icon">${esc(c.icon)}</span><span>${esc(c.name)}</span></button>`).join('')}
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn secondary" data-close>Cancel</button>
+      </div>
+    </div>`, {
+    onMount(root, close) {
+      root.querySelectorAll('[data-cat-id]').forEach(b => b.addEventListener('click', async () => {
+        const catId = Number(b.dataset.catId);
+        close(true);
+        await bulkTxUpdate({ category_id: catId }, 'Moved {n} transaction(s)');
+      }));
+    },
+  });
+}
+
+function openBulkTagModal() {
+  const ids = txSelectedIds();
+  if (!ids.length) return;
+  openModal(`
+    <div class="modal" style="max-width:440px">
+      <div class="modal-head"><h3>Edit tags</h3></div>
+      <div class="modal-body">
+        <p class="help-text" style="margin-top:0">${ids.length} transaction${ids.length === 1 ? '' : 's'} selected.</p>
+        <div class="field">
+          <label>Add tags</label>
+          <input class="input" data-role="tag-add" placeholder="e.g. trip, work (comma separated)">
+        </div>
+        <div class="field">
+          <label>Remove tags</label>
+          <input class="input" data-role="tag-remove" placeholder="e.g. old-tag">
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn secondary" data-close>Cancel</button>
+        <button class="btn" data-role="tag-apply">Apply</button>
+      </div>
+    </div>`, {
+    onMount(root, close) {
+      root.querySelector('[data-role="tag-apply"]').addEventListener('click', async () => {
+        const add = root.querySelector('[data-role="tag-add"]').value.trim();
+        const remove = root.querySelector('[data-role="tag-remove"]').value.trim();
+        if (!add && !remove) return showToast('Enter a tag to add or remove', 'error');
+        close(true);
+        await bulkTxUpdate({ tags_add: add, tags_remove: remove }, 'Updated tags on {n} transaction(s)');
+      });
+    },
+  });
+}
+
+function setupTxBulkBar() {
+  const bar = $('#txBulkBar');
+  if (!bar) return;
+  $('#txBulkAll').addEventListener('click', toggleSelectAllTx);
+  $('#txBulkCategory').addEventListener('click', openBulkCategoryModal);
+  $('#txBulkTag').addEventListener('click', openBulkTagModal);
+  $('#txBulkDelete').addEventListener('click', bulkTxDelete);
+  $('#txBulkCount').addEventListener('click', toggleSelectAllTx);
 }
 
 function monthNavHTML() {
@@ -381,7 +589,7 @@ const RANGE_OPTIONS = [
 
 async function renderTransactions() {
   setViewTitle('Transactions');
-  setViewActions('<button class="btn" data-add>+ Add</button>');
+  renderTxActions();
   const f = State.tx.filters;
 
   // tag options (cached; refreshed when the view loads)
@@ -439,20 +647,20 @@ async function renderTransactions() {
 
   $('#txSearch').addEventListener('input', debounce(e => {
     State.tx.filters.q = e.target.value;
-    loadTx(true);
+    onTxFilterChange();
   }, 350));
-  $('#fType').addEventListener('change', e => { f.type = e.target.value; loadTx(true); });
-  $('#fCat').addEventListener('change', e => { f.category = e.target.value; loadTx(true); });
-  $('#fAccount').addEventListener('change', e => { f.account = e.target.value; loadTx(true); });
-  $('#fTag').addEventListener('change', e => { f.tag = e.target.value; loadTx(true); });
+  $('#fType').addEventListener('change', e => { f.type = e.target.value; onTxFilterChange(); });
+  $('#fCat').addEventListener('change', e => { f.category = e.target.value; onTxFilterChange(); });
+  $('#fAccount').addEventListener('change', e => { f.account = e.target.value; onTxFilterChange(); });
+  $('#fTag').addEventListener('change', e => { f.tag = e.target.value; onTxFilterChange(); });
   $('#fRange').addEventListener('change', e => {
     f.range = e.target.value;
     $('#customRange').style.display = f.range === 'custom' ? '' : 'none';
-    loadTx(true);
+    onTxFilterChange();
   });
-  $('#fFrom').addEventListener('change', e => { f.from = e.target.value; loadTx(true); });
-  $('#fTo').addEventListener('change', e => { f.to = e.target.value; loadTx(true); });
-  $('#fSort').addEventListener('change', e => { f.sort = e.target.value; loadTx(true); });
+  $('#fFrom').addEventListener('change', e => { f.from = e.target.value; onTxFilterChange(); });
+  $('#fTo').addEventListener('change', e => { f.to = e.target.value; onTxFilterChange(); });
+  $('#fSort').addEventListener('change', e => { f.sort = e.target.value; onTxFilterChange(); });
   $$('[data-add]').forEach(b => b.addEventListener('click', () => openTxModal()));
 
   if (State.focusSearch) {
@@ -460,6 +668,11 @@ async function renderTransactions() {
     $('#txSearch').focus();
   }
   await loadTx(true);
+}
+
+function onTxFilterChange() {
+  if (txSelectMode()) setTxSelectMode(false);
+  loadTx(true);
 }
 
 async function loadTx(reset) {
@@ -505,6 +718,7 @@ async function loadTx(reset) {
   }
 
   wireTxRows(listEl, State.tx.rows);
+  updateTxSelectionUI();
 }
 
 function filtersEmpty() {
@@ -964,10 +1178,11 @@ async function renderSettings() {
   const phoneURL = location.origin;
   const isLocal = ['localhost', '127.0.0.1', '::1'].includes(location.hostname);
 
-  const [aiStatus, aiSettings, accData] = await Promise.all([
+  const [aiStatus, aiSettings, accData, authStatus] = await Promise.all([
     api.get('/api/ai/status').catch(() => ({ configured: false, provider: 'none', providers: [] })),
     api.get('/api/settings').catch(() => ({})),
     api.get('/api/accounts').catch(() => ({ accounts: State.accounts })),
+    api.get('/api/auth/status').catch(() => ({ enabled: false, authed: true })),
   ]);
   if (accData && Array.isArray(accData.accounts)) State.accounts = accData.accounts;
   const aiDefaultModel = (aiStatus.providers.find(p => p.id === aiStatus.provider) || {}).defaultModel || '';
@@ -1047,6 +1262,32 @@ async function renderSettings() {
           </div>
         </div>`).join('')}</div>
       <button class="btn secondary" data-add-cat style="margin-top:10px">+ New category</button>
+    </div>
+
+    <div class="card">
+      <div class="card-title">🔒 App lock ${authStatus.enabled ? '<span class="chip">on</span>' : ''}</div>
+      ${authStatus.enabled ? `
+        <div class="field">
+          <label>Current passphrase</label>
+          <input class="input" id="lockCurrent" type="password" autocomplete="current-password" placeholder="Required to change or turn off">
+        </div>` : ''}
+      <div class="field">
+        <label>${authStatus.enabled ? 'New passphrase' : 'Passphrase'}</label>
+        <input class="input" id="lockNew" type="password" autocomplete="new-password" placeholder="At least 8 characters">
+      </div>
+      <div class="field">
+        <label>Confirm passphrase</label>
+        <input class="input" id="lockConfirm" type="password" autocomplete="new-password" placeholder="Repeat it">
+      </div>
+      <div class="flex" style="gap:10px;flex-wrap:wrap">
+        <button class="btn" id="lockSave">${authStatus.enabled ? 'Change passphrase' : 'Turn on app lock'}</button>
+        ${authStatus.enabled ? '<button class="btn secondary" id="lockOff">Turn off</button><button class="btn secondary" id="lockNow">Lock now</button>' : ''}
+      </div>
+      <div class="help-text">
+        ${authStatus.enabled
+          ? 'This device stays unlocked for 30 days. Use <b>Lock now</b> to sign out everywhere you are done, or turn the lock off below.'
+          : 'When on, every device must enter the passphrase before any data is served. There is no recovery, so keep it somewhere safe.'}
+      </div>
     </div>
 
     <div class="card">
@@ -1131,6 +1372,46 @@ async function renderSettings() {
 
   // AI setup
   wireAISettings(aiStatus, aiSettings, aiDefaultModel);
+
+  // app lock
+  const lockNew = $('#lockNew');
+  const lockConfirm = $('#lockConfirm');
+  const lockCurrent = $('#lockCurrent');
+  $('#lockSave').addEventListener('click', async () => {
+    const passphrase = lockNew.value;
+    if (passphrase.length < 8) return showToast('Use at least 8 characters', 'error');
+    if (passphrase !== lockConfirm.value) return showToast('Passphrases do not match', 'error');
+    try {
+      await api.post('/api/auth/enable', {
+        passphrase,
+        current: lockCurrent ? lockCurrent.value : undefined,
+      });
+      showToast(authStatus.enabled ? 'Passphrase changed' : 'App lock is on');
+      refreshView();
+    } catch (err) { showToast(err.message, 'error'); }
+  });
+  if ($('#lockOff')) {
+    $('#lockOff').addEventListener('click', async () => {
+      if (!lockCurrent.value) return showToast('Enter your current passphrase first', 'error');
+      const ok = await confirmDialog({
+        title: 'Turn off app lock?',
+        message: 'Anyone who can reach this URL will be able to open the app without a passphrase.',
+        confirmLabel: 'Turn off',
+      });
+      if (!ok) return;
+      try {
+        await api.post('/api/auth/disable', { passphrase: lockCurrent.value });
+        showToast('App lock is off');
+        refreshView();
+      } catch (err) { showToast(err.message, 'error'); }
+    });
+  }
+  if ($('#lockNow')) {
+    $('#lockNow').addEventListener('click', async () => {
+      await api.post('/api/auth/logout').catch(() => {});
+      showLock();
+    });
+  }
 
   // categories
   $$('[data-edit-cat]').forEach(b => b.addEventListener('click', () => {
