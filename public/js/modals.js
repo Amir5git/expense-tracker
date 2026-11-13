@@ -399,7 +399,7 @@ function openCategoryModal(cat = null, presetType = 'expense', onSaved = null) {
   const emojiGrid = EMOJIS.map(e => `<button type="button" class="emoji-opt ${e === icon ? 'selected' : ''}" data-emoji="${e}">${e}</button>`).join('');
   const colorGrid = COLORS.map(c => `<button type="button" class="color-opt ${c === color ? 'selected' : ''}" data-color="${c}" style="background:${c}" aria-label="${c}"></button>`).join('');
 
-  const body = `
+  const body = () => `
     <div class="field">
       <label>Name</label>
       <input class="input" data-role="cat-name" maxlength="40" placeholder="e.g. Coffee runs" value="${cat ? esc(cat.name) : ''}" autocomplete="off">
