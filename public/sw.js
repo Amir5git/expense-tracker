@@ -10,7 +10,7 @@
  *  - API calls: always live network.
  */
 
-const CACHE = 'expense-tracker-v3';
+const CACHE = 'expense-tracker-v4';
 const SHELL = [
   '/',
   '/index.html',

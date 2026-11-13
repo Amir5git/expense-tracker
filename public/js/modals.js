@@ -455,7 +455,7 @@ function openCategoryModal(cat = null, presetType = 'expense', onSaved = null) {
 
       const delBtn = modal.querySelector('[data-del]');
       if (delBtn) delBtn.addEventListener('click', async () => {
-        const ok = await confirmDialog({ title: `Delete "${cat.name}"?`, message: 'Budgets and recurring rules for this category will also be removed.' });
+        const ok = await confirmDialog({ title: `Delete "${cat.name}"?`, message: 'Categories used by transactions cannot be deleted. Reassign those transactions first.' });
         if (!ok) return;
         try {
           await api.del(`/api/categories/${cat.id}`);

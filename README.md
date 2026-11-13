@@ -1,13 +1,13 @@
 # 💸 Expense Tracker
 
-A full-stack personal expense tracker — add income and expenses, set category
-budgets, automate recurring payments, and see where your money goes with
-charts. Works on desktop and Android/iOS phones (installable as an app).
+A full-stack personal expense tracker — add income and expenses, manage
+accounts and transfers, and see where your money goes with charts. Works on
+desktop and Android/iOS phones (installable as an app).
 
 Includes a **local Smart Engine** (offline intelligence: auto-categorization,
-insights, subscription detection, budget suggestions, weekday-aware forecasts)
-and an optional **AI assistant** — chat with your data and add transactions by
-typing plain English, using a free-tier LLM key of your choice.
+insights, subscription detection and weekday-aware forecasts) and an optional
+**AI assistant** — chat with your data and add transactions by typing plain
+English, using a free-tier LLM key of your choice.
 
 Runs on **Node.js (Hono + SQLite)** for local/LAN use and on **Cloudflare
 Workers + D1** when deployed — the same shared codebase (`app.js`) serves
@@ -116,11 +116,10 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
   ("swiggy order" → Food & Dining) and falls back to built-in keyword
   knowledge for first-time notes
 - **Insights feed** on the dashboard: category anomalies ("Shopping is ₹2,400
-  above your 3-month average"), budget pacing, savings-rate changes, weekend
-  patterns, streaks — each with one-click actions
+  above your 3-month average"), savings-rate changes, weekend patterns and
+  streaks
 - **Subscription detection** — finds near-regular charges (Netflix, rent,
-  utilities) and offers to automate them
-- **Budget suggestions** from trailing averages for unbudgeted categories
+  utilities) and flags them for review
 - **Weekday-aware forecast** — projects month-end spend from how you actually
   spend on each weekday, not a flat daily average
 
@@ -143,21 +142,10 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 
 **Dashboard**
 - Balance, monthly income & expenses with month-over-month change
-- Savings rate and projected month-end spend
+- Savings rate
 - Expenses-by-category donut chart
 - Last 6 months income vs. expenses bar chart
 - Month navigation to view any month
-
-**Budgets**
-- Monthly limit per expense category
-- Progress bars with color states (green / amber when 75%+ / red when over)
-- Over-budget alerts and projected spend
-
-**Recurring transactions**
-- Daily / weekly / monthly / yearly rules (salary, rent, subscriptions…)
-- Auto-posted with catch-up: if the app wasn't open on the due date, the
-  transaction is still recorded — nothing is ever missed
-- Pause/resume rules
 
 **Settings & data**
 - **App lock** — optional passphrase gate for the public URL (PBKDF2-hashed,
@@ -169,14 +157,14 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 - AI assistant configuration (provider, key, model) with connection test
 - CSV export of transactions (includes account + tags)
 - Full JSON backup & restore (settings, accounts, categories, transfers,
-  budgets, rules, tags) — v2 backups include accounts and transfers, and
-  older v1 backups still import
+  transactions, tags) — v2 backups include accounts and transfers, and older
+  v1 backups still import
 - One-click sample data for exploring
 - Danger zone to wipe all data (accounts and categories are kept)
 
 **Platform**
-- Responsive: sidebar on desktop; 5-item bottom navigation + FAB on mobile,
-  with Accounts and Settings shortcuts in the top-right
+- Responsive: sidebar on desktop; 5-item bottom navigation (Home, Activity,
+  Accounts, Stats, Settings) + FAB on mobile
 - Smooth, reduced-motion-aware animations, a liquid bottom-nav indicator,
   tap ripples, and pill-shaped controls
 - Mobile gestures: swipe left/right between bottom-nav tabs, pull down at the
@@ -184,8 +172,7 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 - Installable PWA with offline app shell (data needs the server)
 - Keyboard shortcuts: `N` new transaction, `/` search
 - Mobile bottom-sheet modals, desktop dialogs
-- SQLite with WAL mode, transaction-safe recurring engine, input validation
-  everywhere
+- SQLite with WAL mode, input validation everywhere
 
 ---
 
@@ -194,7 +181,7 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 ```
 server.js               Node.js entry — Hono app + static files (npm start)
 worker.js                Cloudflare Workers entry — D1 binding (npm run deploy)
-app.js                   Shared backend — all API routes, schema, recurring engine
+app.js                   Shared backend — all API routes and schema
 db.js                   Database adapters: node:sqlite ↔ Cloudflare D1
 smart.js                Smart Engine (suggestions, insights, analytics)
 ai.js                   AI layer (BYO-key provider proxy)
@@ -208,8 +195,8 @@ public/
     state.js            Shared state, helpers, formatting
     api.js              Fetch wrapper
     charts.js           SVG donut + bar charts, heatmap, weekday chart
-    modals.js           Transaction/account/transfer/CSV/category/budget/recurring dialogs
-    views.js            Dashboard/transactions/accounts/analytics/budgets/recurring/settings
+    modals.js           Transaction/account/transfer/CSV/category dialogs
+    views.js            Dashboard/transactions/accounts/analytics/settings
     app.js              Router, theme, keyboard shortcuts, init
 scripts/gen-icons.js    Regenerates PWA icons (npm run icons)
 data/expenses.db        SQLite database (Node mode, created on first run)
@@ -228,13 +215,10 @@ data/expenses.db        SQLite database (Node mode, created on first run)
 | POST | `/api/import/csv` | Import a mapped bank CSV with duplicate skipping |
 | GET | `/api/tags` | All tags in use |
 | GET/POST/PUT/DELETE | `/api/categories` | CRUD with usage protection |
-| GET/PUT/DELETE | `/api/budgets` | Monthly budgets + spent amounts |
-| GET/POST/PUT/DELETE | `/api/recurring` | Recurring rules, auto-processing |
 | GET | `/api/summary` | Dashboard aggregates + account balances/net worth |
 | GET | `/api/smart/insights` | Generated insights feed for a month |
 | POST | `/api/smart/suggest` | Category/method suggestion for a note |
 | GET | `/api/smart/subscriptions` | Detected near-regular charges |
-| GET | `/api/smart/budget-suggestions` | Suggested budgets from history |
 | GET | `/api/analytics` | Heatmap/weekday/merchants/methods/streaks/trend |
 | GET | `/api/ai/status` | AI configuration status + provider list |
 | POST | `/api/ai/ask` | Chat with your data (needs key) |
@@ -244,7 +228,11 @@ data/expenses.db        SQLite database (Node mode, created on first run)
 | GET | `/api/export?format=json\|csv` | Backup (v2 incl. accounts + transfers) / CSV export |
 | POST | `/api/import` | Restore backup (v1 or v2) |
 | POST | `/api/sample-data` | Load demo data (only when empty) |
-| DELETE | `/api/data?confirm=DELETE` | Wipe transactions/transfers/budgets/rules |
+| DELETE | `/api/data?confirm=DELETE` | Wipe transactions and transfers |
+
+Older backups that contain budgets or recurring rules still import safely.
+Those tables are kept in the database for backup compatibility, but they are
+hidden in the app and no longer post transactions automatically.
 
 `npm run tunnel` — expose the app on a temporary public `https://…trycloudflare.com`
 URL (for phone access when local Wi-Fi access is blocked).
@@ -351,8 +339,8 @@ Notes on the Cloudflare deployment:
   (Settings → Full backup) and restore it in the deployed app's Settings.
   Imports are automatically chunked to respect D1's per-invocation query
   limit on the free plan.
-- **Timezone**: Workers run in UTC, so "today" flips at 05:30 IST —
-  recurring catch-up posting and forecasts use UTC day boundaries.
+- **Timezone**: Workers run in UTC, so "today" flips at 05:30 IST — date
+  boundaries and forecasts use UTC days.
 - `npm run dev:cf` runs the *same* code locally on workerd (Cloudflare's
   actual runtime) with a simulated D1 in `.wrangler/` — useful to verify the
   deploy path before deploying. Re-run `npm run deploy` to update the live
@@ -396,11 +384,8 @@ you exported from your local instance (Settings → Full backup → Download JSO
 - Regenerate icons after changing the design: `npm run icons`
 - **Set opening balances first** (Accounts → ✏️) so balances and net worth
   start from reality. Negative opening balances model credit-card dues.
-- Deleting an account is blocked while transactions, recurring rules or
-  transfers use it — **archive** it instead to keep history but hide it from
-  pickers.
+- Deleting an account is blocked while transactions or transfers use it —
+  **archive** it instead to keep history but hide it from pickers.
 - Transactions from before accounts existed appear under the **No account**
   filter; edit them to assign an account and tighten your net worth.
 - Change the port: `PORT=8080 npm start` (or `set PORT=8080` on Windows)
-- The recurring engine runs on server start, on each relevant API call, and
-  hourly — so due transactions are posted even if nobody opens the app.

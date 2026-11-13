@@ -264,32 +264,6 @@ module.exports = function createSmart(ctx) {
       }
     }
 
-    /* budget pacing */
-    const budgets = await db.all(`
-      SELECT b.category_id, b.amount, c.name, c.icon FROM budgets b JOIN categories c ON c.id = b.category_id`);
-    const isCurrentMonth = month === currentMonthKey();
-    for (const b of budgets) {
-      const spent = perCat[b.category_id] ? (perCat[b.category_id][month] || 0) : 0;
-      const used = b.amount > 0 ? spent / b.amount : 0;
-      if (used >= 1) {
-        out.push({
-          id: `budget-over-${b.category_id}`,
-          severity: 'warn',
-          icon: '🚨',
-          title: `${b.name} budget exceeded`,
-          body: `${money(spent)} spent of the ${money(b.amount)} budget.`,
-        });
-      } else if (isCurrentMonth && used >= 0.75) {
-        out.push({
-          id: `budget-near-${b.category_id}`,
-          severity: 'warn',
-          icon: '⚠️',
-          title: `${b.name} budget is ${Math.round(used * 100)}% used`,
-          body: `${money(b.amount - spent)} left with ${monthDaysLeft(month)} days to go.`,
-        });
-      }
-    }
-
     /* subscriptions found in the wild */
     for (const s of (await detectSubscriptions()).slice(0, 2)) {
       out.push({
@@ -297,23 +271,7 @@ module.exports = function createSmart(ctx) {
         severity: 'info',
         icon: '🔁',
         title: `Possible ${s.frequency} charge: ${s.note}`,
-        body: `${money(s.amount)} ≈ every ${s.gap} days (last: ${s.last_date}). Automate it so it's never missed.`,
-        cta: { kind: 'recurring', label: 'Automate', payload: {
-          type: 'expense', amount: s.amount, category_id: s.category_id,
-          frequency: s.frequency, next_date: s.next_date, note: s.note,
-        } },
-      });
-    }
-
-    /* budget suggestions for unbudgeted active categories */
-    for (const s of (await budgetSuggestions(month)).slice(0, 2)) {
-      out.push({
-        id: `sug-${s.category_id}`,
-        severity: 'info',
-        icon: '💡',
-        title: `No budget for ${s.name}`,
-        body: `You averaged ${money(s.based_on)} over the last ${s.months} months. A ${money(s.suggested)} budget would fit your habits.`,
-        cta: { kind: 'budget', label: `Set ${money(s.suggested)}`, payload: { category_id: s.category_id, amount: s.suggested } },
+        body: `${money(s.amount)} ≈ every ${s.gap} days (last: ${s.last_date}). Worth reviewing — cancel it or renegotiate if you don't use it.`,
       });
     }
 
@@ -387,7 +345,7 @@ module.exports = function createSmart(ctx) {
       out.push({
         id: 'no-income', severity: 'info', icon: '📭',
         title: 'No income recorded this month',
-        body: 'Add salary or other income so savings rate and budgets are accurate.',
+        body: 'Add salary or other income so your savings rate is accurate.',
       });
     }
 

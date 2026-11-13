@@ -579,17 +579,6 @@ function createApp(db, opts = {}) {
     }
   }
 
-  // Node entry only: post anything already due at boot + once an hour.
-  if (opts.recurringTimer) {
-    processRecurring().catch(err => console.error('[recurring] failed:', err));
-    const timer = setInterval(() => {
-      processRecurring()
-        .then(n => { if (n) console.log(`[recurring] posted ${n} transaction(s)`); })
-        .catch(err => console.error('[recurring] failed:', err));
-    }, 60 * 60 * 1000);
-    if (timer.unref) timer.unref();
-  }
-
   /* ---- app ---- */
 
   const app = new Hono();
@@ -718,7 +707,6 @@ function createApp(db, opts = {}) {
 
   /* ---- bootstrap ---- */
   app.get('/api/bootstrap', async (c) => {
-    await processRecurring();
     return c.json({
       settings: { currency: await getSetting('currency', 'INR'), theme: await getSetting('theme', 'system') },
       categories: await db.all('SELECT * FROM categories ORDER BY type, name'),
@@ -771,7 +759,6 @@ function createApp(db, opts = {}) {
 
   /* ---- transactions ---- */
   app.get('/api/transactions', async (c) => {
-    await processRecurring();
     const { type, category, account, from, to, q, tag, sort } = c.req.query();
 
     const where = [];
@@ -1256,7 +1243,6 @@ function createApp(db, opts = {}) {
 
   /* ---- recurring ---- */
   app.get('/api/recurring', async (c) => {
-    await processRecurring();
     const rows = await db.all(`
       SELECT r.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color,
              a.name AS account_name, a.icon AS account_icon, a.color AS account_color
@@ -1353,7 +1339,6 @@ function createApp(db, opts = {}) {
 
   /* ---- summary / dashboard ---- */
   app.get('/api/summary', async (c) => {
-    await processRecurring();
     const month = validMonthKeyOrCurrent(c.req.query('month'));
     const { start, end, days } = monthRange(month);
     const prevMonth = addMonthsKey(month, -1);
@@ -1435,7 +1420,6 @@ function createApp(db, opts = {}) {
 
   /* ---- smart engine ---- */
   app.get('/api/smart/insights', async (c) => {
-    await processRecurring();
     const month = validMonthKeyOrCurrent(c.req.query('month'));
     return c.json({ month, insights: await SmartEngine.insights(month) });
   });
@@ -1453,7 +1437,6 @@ function createApp(db, opts = {}) {
   });
 
   app.get('/api/analytics', async (c) => {
-    await processRecurring();
     const month = validMonthKeyOrCurrent(c.req.query('month'));
     return c.json(await SmartEngine.analytics(month));
   });

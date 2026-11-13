@@ -29,7 +29,7 @@ const DB_PATH = path.join(DATA_DIR, 'expenses.db');
   const db = new NodeDB(DB_PATH);
   await ensureSchema(db);
 
-  const app = createApp(db, { recurringTimer: true });
+  const app = createApp(db);
 
   /* request log — enable with ACCESS_LOG=1 (useful for diagnosing access) */
   if (LOG_ACCESS) {

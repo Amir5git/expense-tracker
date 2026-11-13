@@ -4,7 +4,7 @@
    App entry — router, theme, init
    ============================================================ */
 
-const VIEWS = ['dashboard', 'transactions', 'accounts', 'analytics', 'budgets', 'recurring', 'settings'];
+const VIEWS = ['dashboard', 'transactions', 'accounts', 'analytics', 'settings'];
 
 async function init() {
   api.onAuthRequired = () => showLock();
@@ -125,8 +125,9 @@ async function onUnlockSubmit(e) {
 }
 
 function route() {
-  const name = (location.hash || '#/dashboard').replace(/^#\//, '') || 'dashboard';
-  const next = VIEWS.includes(name) ? name : 'dashboard';
+  const raw = (location.hash || '#/dashboard').replace(/^#\//, '') || 'dashboard';
+  const next = VIEWS.includes(raw) ? raw : 'dashboard';
+  if (next !== raw) history.replaceState(null, '', '#/' + next);
   const changed = next !== State.view;
   if (next !== 'transactions' && State.tx.selectMode) setTxSelectMode(false);
   State.view = next;
@@ -145,8 +146,6 @@ async function renderCurrent() {
       case 'transactions': await renderTransactions(); break;
       case 'accounts': await renderAccounts(); break;
       case 'analytics': await renderAnalytics(); break;
-      case 'budgets': await renderBudgets(); break;
-      case 'recurring': await renderRecurring(); break;
       case 'settings': await renderSettings(); break;
       default: await renderDashboard();
     }
@@ -181,6 +180,12 @@ function setupBottomNav() {
     cancelAnimationFrame(navResizeRaf);
     navResizeRaf = requestAnimationFrame(() => positionNavLiquid({ instant: true }));
   });
+  // Content (charts, long labels) can change the layout width without a window
+  // resize event. Keep the liquid pill aligned with the active tab.
+  if ('ResizeObserver' in window) {
+    const observer = new ResizeObserver(() => positionNavLiquid({ instant: true }));
+    observer.observe(nav);
+  }
 }
 
 /* Slide the liquid pill so it sits under the active tab. */
@@ -231,7 +236,7 @@ function onNavPointerDown(e) {
 
 /* ---------- mobile gestures: swipe tabs, pull to refresh ---------- */
 
-const TAB_ORDER = ['dashboard', 'transactions', 'budgets', 'analytics', 'recurring'];
+const TAB_ORDER = ['dashboard', 'transactions', 'accounts', 'analytics', 'settings'];
 const SWIPE_THRESHOLD = 64;
 const PULL_THRESHOLD = 90;
 

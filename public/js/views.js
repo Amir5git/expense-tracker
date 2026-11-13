@@ -19,7 +19,6 @@ function txRowHTML(tx, { showDate = false, showMethod = true } = {}) {
     if (tx.account_name) sub.push(`${esc(tx.account_icon || '🏦')} ${esc(tx.account_name)}`);
     else sub.push(esc(METHOD_LABEL[tx.method] || tx.method));
   }
-  if (tx.recurring_id) sub.push('🔁 auto');
   if (showDate) sub.push(esc(shortDate(tx.date)));
   return `
     <div class="tx-row${selecting ? ' selectable' : ''}${checked ? ' selected' : ''}" data-tx-id="${tx.id}" role="button" tabindex="0" title="${selecting ? 'Select' : 'Edit'}">
@@ -339,28 +338,6 @@ async function renderDashboard() {
       </div>
     </div>` : '';
 
-  // budget strip
-  let budgetHTML = '';
-  if (data.budgets.length) {
-    const totalBudget = data.budgets.reduce((a, b) => a + b.amount, 0);
-    const totalSpent = data.budgets.reduce((a, b) => a + b.spent, 0);
-    const p = totalBudget > 0 ? (totalSpent / totalBudget) * 100 : 0;
-    const over = totalSpent - totalBudget;
-    budgetHTML = `
-      <div class="card">
-        <div class="card-title">Budgets <span class="link" data-goto="budgets">Manage →</span></div>
-        <div class="budget-line"><span>Spent on budgeted categories</span><b>${esc(fmtMoney(totalSpent))} / ${esc(fmtMoney(totalBudget))}</b></div>
-        ${progressBarHTML(totalSpent, totalBudget)}
-        <div class="budget-line">
-          <span>${over > 0
-            ? `<span class="over-text">Over budget by ${esc(fmtMoney(over))}</span>`
-            : `${esc(fmtMoney(totalBudget - totalSpent))} left`}</span>
-          <span>${Math.round(p)}% used</span>
-        </div>
-        ${data.projected !== null ? `<div class="help-text">Projected month-end spend: <b>${esc(fmtMoney(data.projected))}</b></div>` : ''}
-      </div>`;
-  }
-
   const donutSegments = data.byCategory.map(c => ({ label: c.name, value: c.amount, color: c.color }));
 
   const trendMap = Object.fromEntries(data.trend.map(t => [t.ym, t]));
@@ -369,8 +346,6 @@ async function renderDashboard() {
     const ym = addMonthsKey(State.month, i);
     groups.push(trendMap[ym] || { ym, income: 0, expense: 0 });
   }
-
-  const unbudgeted = m.expense - data.budgets.reduce((a, b) => a + b.spent, 0);
 
   const insightsHTML = insights.length ? `
     <div class="card insight-card">
@@ -437,12 +412,10 @@ async function renderDashboard() {
     </div>
     ${accountsCard}
     ${insightsHTML}
-    ${budgetHTML}
     <div class="grid-2">
       <div class="card">
         <div class="card-title">Expenses by category</div>
         <div id="dashDonut"></div>
-        ${unbudgeted > 0 && data.budgets.length ? `<div class="help-text">+ ${esc(fmtMoney(unbudgeted))} spent in unbudgeted categories</div>` : ''}
       </div>
       <div class="card">
         <div class="card-title">Last 6 months</div>
@@ -460,22 +433,7 @@ async function renderDashboard() {
   wireTxRows(view, data.recent);
   wireMonthNav();
   wireDashboardCommon();
-  wireInsightCTAs();
   wireAICard();
-}
-
-function wireInsightCTAs() {
-  $$('[data-cta]').forEach(btn => {
-    btn.addEventListener('click', async () => {
-      let cta;
-      try { cta = JSON.parse(btn.dataset.cta); } catch { return; }
-      if (cta.kind === 'budget') {
-        openBudgetModal(cta.payload.category_id ? { category_id: cta.payload.category_id, amount: cta.payload.amount } : null);
-      } else if (cta.kind === 'recurring') {
-        openRecurringModal(null, cta.payload);
-      }
-    });
-  });
 }
 
 /* ---------- AI assistant card ---------- */
@@ -1314,7 +1272,7 @@ async function renderSettings() {
           <span class="v"><button class="btn small secondary" id="btnSample">Load demo data</button></span>
         </div>
       </div>
-      <div class="help-text">Backups include settings, accounts, categories, transfers, budgets and recurring rules. Restoring replaces all current data.</div>
+      <div class="help-text">Backups include settings, accounts, categories, transfers and transactions. Restoring replaces all current data.</div>
     </div>
 
     <div class="card">
@@ -1338,7 +1296,7 @@ async function renderSettings() {
           <span class="v"><button class="btn small danger" id="btnWipe">Delete everything</button></span>
         </div>
       </div>
-      <div class="help-text">Removes all transactions, transfers, budgets and recurring rules. Accounts, categories and settings are kept.</div>
+      <div class="help-text">Removes all transactions and transfers. Accounts, categories and settings are kept.</div>
     </div>
 
     <div class="card">
@@ -1430,7 +1388,7 @@ async function renderSettings() {
   $('#btnWipe').addEventListener('click', async () => {
     const ok = await confirmDialog({
       title: 'Delete ALL data?',
-      message: 'Every transaction, budget and recurring rule will be permanently deleted. Export a backup first if you might want it back.',
+      message: 'Every transaction and transfer will be permanently deleted. Export a backup first if you might want it back.',
       confirmLabel: 'Delete everything',
     });
     if (!ok) return;
@@ -1517,7 +1475,7 @@ async function loadSampleData() {
   try {
     ok = await confirmDialog({
       title: 'Load sample data?',
-      message: 'Adds ~3 months of realistic demo transactions, budgets and recurring rules. Only works when the app is empty.',
+      message: 'Adds ~3 months of realistic demo transactions. Only works when the app is empty.',
       confirmLabel: 'Load sample data',
       danger: false,
     });
