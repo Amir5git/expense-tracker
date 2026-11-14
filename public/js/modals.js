@@ -218,6 +218,96 @@ async function reloadCategories() {
    Transaction modal
    ============================================================ */
 
+/* ---------- receipt photos ---------- */
+
+const RECEIPT_MAX_DIM = 1600;
+const RECEIPT_MAX_CHARS = 1300000;
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const url = String(reader.result || '');
+      const comma = url.indexOf(',');
+      resolve(comma >= 0 ? url.slice(comma + 1) : '');
+    };
+    reader.onerror = () => reject(new Error('Could not read that image'));
+    reader.readAsDataURL(file);
+  });
+}
+
+function loadBitmap(file) {
+  if (typeof createImageBitmap === 'function') {
+    return createImageBitmap(file).catch(() => loadViaImg(file));
+  }
+  return loadViaImg(file);
+}
+
+function loadViaImg(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => { URL.revokeObjectURL(url); resolve(img); };
+    img.onerror = () => { URL.revokeObjectURL(url); reject(new Error('Could not read that image')); };
+    img.src = url;
+  });
+}
+
+function drawJpeg(bitmap, maxDim, quality) {
+  const w0 = bitmap.width || bitmap.naturalWidth || 1;
+  const h0 = bitmap.height || bitmap.naturalHeight || 1;
+  const scale = Math.min(1, maxDim / Math.max(w0, h0));
+  const w = Math.max(1, Math.round(w0 * scale));
+  const h = Math.max(1, Math.round(h0 * scale));
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0, 0, w, h);
+  ctx.drawImage(bitmap, 0, 0, w, h);
+  return canvas.toDataURL('image/jpeg', quality);
+}
+
+/** Compress a photo in the browser so uploads stay small. */
+async function prepareReceiptImage(file) {
+  if (!file || !/^image\//.test(file.type || '')) throw new Error('Choose an image file');
+  if (file.size > 12 * 1024 * 1024) throw new Error('Image is too large (max 12 MB)');
+
+  // Keep animated GIFs as-is; compressing would flatten them.
+  if (file.type === 'image/gif') {
+    const data = await fileToBase64(file);
+    if (data.length > RECEIPT_MAX_CHARS) throw new Error('GIF is too large — try a JPEG or PNG');
+    return { mime: 'image/gif', data };
+  }
+
+  const bitmap = await loadBitmap(file);
+  let dataUrl = drawJpeg(bitmap, RECEIPT_MAX_DIM, 0.82);
+  if (dataUrl.length > RECEIPT_MAX_CHARS) dataUrl = drawJpeg(bitmap, 1100, 0.68);
+  if (dataUrl.length > RECEIPT_MAX_CHARS) dataUrl = drawJpeg(bitmap, 800, 0.55);
+  if (bitmap.close) bitmap.close();
+  if (dataUrl.length > RECEIPT_MAX_CHARS) throw new Error('Image is too large even after compressing — try a smaller photo');
+
+  return { mime: 'image/jpeg', data: dataUrl.slice(dataUrl.indexOf(',') + 1) };
+}
+
+function receiptExt(mime) {
+  return mime === 'image/png' ? 'png' : mime === 'image/webp' ? 'webp' : mime === 'image/gif' ? 'gif' : 'jpg';
+}
+
+function openReceiptViewer(mime, data) {
+  const src = `data:${mime};base64,${data}`;
+  openModal(`
+    <div class="modal receipt-modal">
+      <div class="modal-head"><h3>Receipt</h3><button class="icon-btn" data-close aria-label="Close">✕</button></div>
+      <div class="modal-body receipt-viewer"><img src="${src}" alt="Receipt photo"></div>
+      <div class="modal-foot">
+        <a class="btn secondary" download="receipt.${receiptExt(mime)}" href="${src}">Download</a>
+        <button class="btn" data-close>Close</button>
+      </div>
+    </div>`);
+}
+
 function openTxModal(tx = null, prefill = null) {
   const base = tx || prefill || {};
   let type = base.type || 'expense';
@@ -228,6 +318,48 @@ function openTxModal(tx = null, prefill = null) {
   let accountId = base.account_id != null
     ? Number(base.account_id)
     : (isNew ? (State.lastAccountId != null ? Number(State.lastAccountId) : (firstAccount ? firstAccount.id : null)) : null);
+
+  // Receipt state survives the small re-renders caused by switching type.
+  const receipt = {
+    existing: !!(tx && tx.has_receipt),
+    remove: false,
+    mime: '',
+    data: '',
+    preview: '',
+  };
+  const receiptBoxHTML = () => {
+    if (receipt.remove) {
+      return `
+        <div class="receipt-note">The attached receipt will be removed when you save.</div>
+        <button type="button" class="btn ghost small" data-receipt-undo>Undo</button>`;
+    }
+    if (receipt.preview) {
+      return `
+        <div class="receipt-preview">
+          <img src="${receipt.preview}" alt="Receipt preview">
+          <div class="receipt-actions">
+            <button type="button" class="btn ghost small" data-receipt-view>View full</button>
+            <button type="button" class="btn ghost small" data-receipt-remove>Remove</button>
+          </div>
+        </div>`;
+    }
+    if (receipt.existing) {
+      return `
+        <div class="receipt-attached">
+          <span class="receipt-attached-label">📎 Receipt attached</span>
+          <span class="receipt-actions">
+            <button type="button" class="btn ghost small" data-receipt-view>View</button>
+            <button type="button" class="btn ghost small" data-receipt-remove>Remove</button>
+          </span>
+        </div>`;
+    }
+    return `
+      <label class="btn ghost receipt-pick">
+        <input type="file" accept="image/*" data-receipt-file hidden>
+        📷 Add receipt photo
+      </label>
+      <div class="help-text">Compressed before upload and included in your backup.</div>`;
+  };
 
   const body = () => `
     <div class="field">
@@ -270,6 +402,10 @@ function openTxModal(tx = null, prefill = null) {
       <input class="input" data-role="tx-tags" placeholder="e.g. work, reimbursable" maxlength="120"
         value="${base.tags ? esc(parseTags(base.tags).join(', ')) : ''}" autocomplete="off">
       <div class="help-text">Comma separated. Filter by them later on the Transactions page.</div>
+    </div>
+    <div class="field">
+      <label>Receipt (optional)</label>
+      <div data-role="receipt-box">${receiptBoxHTML()}</div>
     </div>`;
 
   const close = openModal(modalShell(tx ? 'Edit transaction' : 'Add transaction', body(), tx ? '<button class="btn danger" data-del>Delete</button>' : ''), {
@@ -277,6 +413,67 @@ function openTxModal(tx = null, prefill = null) {
       const rerender = () => {
         modal.querySelector('.modal-body').innerHTML = body();
         wire(modal);
+      };
+      const refreshReceipt = (m) => {
+        const box = m.querySelector('[data-role="receipt-box"]');
+        if (!box) return;
+        box.innerHTML = receiptBoxHTML();
+        wireReceipt(m);
+      };
+      const wireReceipt = (m) => {
+        const box = m.querySelector('[data-role="receipt-box"]');
+        if (!box) return;
+
+        const file = box.querySelector('[data-receipt-file]');
+        if (file) file.addEventListener('change', async () => {
+          const f = file.files && file.files[0];
+          if (!f) return;
+          try {
+            file.disabled = true;
+            const out = await prepareReceiptImage(f);
+            receipt.data = out.data;
+            receipt.mime = out.mime;
+            receipt.preview = `data:${out.mime};base64,${out.data}`;
+            receipt.remove = false;
+            receipt.existing = false;
+            refreshReceipt(m);
+          } catch (err) {
+            file.disabled = false;
+            showToast(err.message || 'Could not read that image', 'error');
+          }
+        });
+
+        const view = box.querySelector('[data-receipt-view]');
+        if (view) view.addEventListener('click', async () => {
+          if (receipt.data) { openReceiptViewer(receipt.mime, receipt.data); return; }
+          if (!tx) return;
+          try {
+            view.disabled = true;
+            const r = await api.get(`/api/transactions/${tx.id}/receipt`);
+            receipt.mime = r.mime;
+            receipt.data = r.data;
+            receipt.preview = `data:${r.mime};base64,${r.data}`;
+            refreshReceipt(m);
+            openReceiptViewer(r.mime, r.data);
+          } catch (err) { showToast(err.message, 'error'); }
+          finally { view.disabled = false; }
+        });
+
+        const remove = box.querySelector('[data-receipt-remove]');
+        if (remove) remove.addEventListener('click', () => {
+          receipt.data = '';
+          receipt.preview = '';
+          receipt.existing = false;
+          receipt.remove = !!tx;
+          refreshReceipt(m);
+        });
+
+        const undo = box.querySelector('[data-receipt-undo]');
+        if (undo) undo.addEventListener('click', () => {
+          receipt.remove = false;
+          receipt.existing = !!(tx && tx.has_receipt);
+          refreshReceipt(m);
+        });
       };
       const wire = (m) => {
         // type segmented
@@ -288,6 +485,7 @@ function openTxModal(tx = null, prefill = null) {
           });
         });
         wireCatGrid(m, () => categoryId, v => { categoryId = v; categoryTouched = true; });
+        wireReceipt(m);
       };
       wire(modal);
 
@@ -328,16 +526,39 @@ function openTxModal(tx = null, prefill = null) {
         if (!date) return showToast('Pick a date', 'error');
 
         const payload = { type, amount, category_id: categoryId, date, note, tags, account_id };
+        const okBtn = modal.querySelector('[data-ok]');
         try {
-          modal.querySelector('[data-ok]').disabled = true;
-          if (tx) await api.put(`/api/transactions/${tx.id}`, payload);
-          else await api.post('/api/transactions', payload);
+          okBtn.disabled = true;
+          const saved = tx
+            ? await api.put(`/api/transactions/${tx.id}`, payload)
+            : await api.post('/api/transactions', payload);
+          const txId = tx ? tx.id : (saved && saved.id);
+
+          // Receipts need a transaction id, so this happens after the save.
+          let receiptWarning = '';
+          if (txId) {
+            try {
+              if (receipt.remove) {
+                try { await api.del(`/api/transactions/${txId}/receipt`); }
+                catch (err) { if (!/no receipt/i.test(err.message)) throw err; }
+              } else if (receipt.data) {
+                await api.put(`/api/transactions/${txId}/receipt`, { mime: receipt.mime, data: receipt.data });
+              }
+            } catch (err) {
+              receiptWarning = err.message;
+            }
+          }
+
           if (account_id) State.lastAccountId = account_id;
-          showToast(tx ? 'Transaction updated' : `${type === 'income' ? 'Income' : 'Expense'} added`);
+          if (receiptWarning) {
+            showToast(`Saved, but the receipt failed: ${receiptWarning}`, 'error', { duration: 7000 });
+          } else {
+            showToast(tx ? 'Transaction updated' : `${type === 'income' ? 'Income' : 'Expense'} added`);
+          }
           closeModal(true);
           refreshView();
         } catch (err) {
-          modal.querySelector('[data-ok]').disabled = false;
+          okBtn.disabled = false;
           showToast(err.message, 'error');
         }
       });
@@ -810,6 +1031,187 @@ function openTransferModal() {
 /* ============================================================
    CSV bank statement import
    ============================================================ */
+
+/* ============================================================
+   Data cleanup (scan → preview → apply)
+   ============================================================ */
+
+function openCleanupModal(onDone) {
+  let scan = null;
+  let accountId = (activeAccounts()[0] || {}).id ?? null;
+
+  const section = (key, title, desc, count, bodyHtml, extra = '') => `
+    <div class="cleanup-section">
+      <div class="cleanup-section-head">
+        <h4>${title}</h4>
+        <label class="cleanup-check">
+          <input type="checkbox" data-clean-${key} ${count > 0 ? 'checked' : ''} ${count > 0 ? '' : 'disabled'}>
+          ${count} item${count === 1 ? '' : 's'}
+        </label>
+      </div>
+      <p>${desc}</p>
+      ${extra}
+      ${count > 0 ? bodyHtml : ''}
+    </div>`;
+
+  const scanHTML = () => {
+    const t = scan.totals;
+    const total = t.duplicate_rows + t.missing_account + t.recategorize + t.legacy + t.orphan_receipts;
+    if (!total) {
+      return `
+        <div class="empty" style="padding:20px 0">
+          <div class="empty-icon">✨</div>
+          <h3>Nothing to clean up</h3>
+          <p>No duplicate rows, unassigned accounts, hidden legacy data or orphaned receipts were found.</p>
+        </div>`;
+    }
+
+    const dup = scan.duplicates;
+    const dupBody = dup.groups.slice(0, 6).map(g => {
+      const r = g.rows[0];
+      return `
+        <div class="cleanup-item">
+          <span>${esc(r.category_icon || '📦')}</span>
+          <div class="cleanup-item-main">
+            <b>${esc(r.note || r.category_name)}</b>
+            <span>${esc(shortDate(r.date))} · ${esc(fmtMoney(r.amount))} · keep #${g.keep_id}, remove ${g.ids.length - 1}</span>
+          </div>
+        </div>`;
+    }).join('');
+
+    const missing = scan.missing_account;
+    const missingBody = missing.rows.slice(0, 6).map(r => `
+      <div class="cleanup-item">
+        <span>${esc(r.category_icon || '📦')}</span>
+        <div class="cleanup-item-main">
+          <b>${esc(r.note || r.category_name)}</b>
+          <span>${esc(shortDate(r.date))} · ${esc(fmtMoney(r.amount))} · no account</span>
+        </div>
+      </div>`).join('');
+
+    const recat = scan.recategorize;
+    const recatBody = recat.suggestions.slice(0, 12).map(s => `
+      <div class="cleanup-item">
+        <span>${esc(s.from_icon || '📦')}</span>
+        <div class="cleanup-item-main">
+          <b>${esc(s.note || s.from_category)}</b>
+          <span>${esc(s.from_category)} <span class="cleanup-arrow">→</span> ${esc(s.to_category)} · ${s.confidence}% sure</span>
+        </div>
+      </div>`).join('') + (recat.total > 12 ? `<div class="cleanup-preview-note">…and ${recat.total - 12} more suggestions.</div>` : '');
+
+    const legacy = scan.legacy;
+    const legacyBody = `
+      <div class="cleanup-item">
+        <span>🎯</span>
+        <div class="cleanup-item-main"><b>${legacy.budgets} budget row${legacy.budgets === 1 ? '' : 's'}</b><span>No longer shown in the app</span></div>
+      </div>
+      <div class="cleanup-item">
+        <span>🔁</span>
+        <div class="cleanup-item-main"><b>${legacy.recurring} recurring rule${legacy.recurring === 1 ? '' : 's'}</b><span>Auto-posting is disabled</span></div>
+      </div>`;
+
+    const orphans = scan.orphan_receipts;
+
+    return `
+      <div class="cleanup-summary">
+        <div class="cleanup-stat"><b>${t.duplicate_rows}</b><span>Duplicate rows</span></div>
+        <div class="cleanup-stat"><b>${t.missing_account}</b><span>No account</span></div>
+        <div class="cleanup-stat"><b>${t.recategorize}</b><span>Category fixes</span></div>
+        <div class="cleanup-stat"><b>${t.legacy}</b><span>Legacy rows</span></div>
+        <div class="cleanup-stat"><b>${t.orphan_receipts}</b><span>Orphan receipts</span></div>
+      </div>
+
+      ${section('dup', 'Exact duplicates', 'Keeps the oldest row in each group and removes the rest.', dup.delete_count, dupBody)}
+      ${section('missing', 'Transactions without an account', 'Assign every unassigned transaction to one account.', missing.count, missingBody,
+        `<div class="cleanup-account"><select class="input" data-clean-account>${accountOptionsHTML(accountId, false)}</select></div>`)}
+      ${section('recat', 'Category suggestions', 'Confident matches from your notes and past categories. Each change is re-checked before applying.', recat.total, recatBody)}
+      ${section('legacy', 'Hidden legacy data', 'Budgets and recurring rules are no longer in the app. Removing them only deletes that hidden data.', legacy.budgets + legacy.recurring, legacyBody)}
+      ${section('orphan', 'Orphaned receipts', 'Receipt photos whose transaction no longer exists.', orphans.count,
+        orphans.rows.slice(0, 6).map(r => `
+          <div class="cleanup-item">
+            <span>🧾</span>
+            <div class="cleanup-item-main"><b>Receipt for transaction #${r.transaction_id}</b><span>${esc(r.mime)} · ${Math.round((r.size || 0) / 1024)} KB</span></div>
+          </div>`).join(''))}
+
+      <div class="cleanup-preview-note">This is a preview — nothing changes until you press <b>Apply selected</b>.</div>`;
+  };
+
+  const close = openModal(
+    modalShell('Data cleanup', '<div data-clean-body><div class="loading-block">Scanning your data…</div></div>',
+      '<button class="btn secondary" data-rescan>Rescan</button>', 'Apply selected'),
+    {
+      async onMount(modal, closeModal) {
+        const bodyEl = modal.querySelector('[data-clean-body]');
+        const okBtn = modal.querySelector('[data-ok]');
+
+        const load = async () => {
+          okBtn.disabled = true;
+          bodyEl.innerHTML = '<div class="loading-block">Scanning your data…</div>';
+          try {
+            scan = await api.get('/api/cleanup/scan');
+            bodyEl.innerHTML = scanHTML();
+            const sel = bodyEl.querySelector('[data-clean-account]');
+            if (sel) {
+              accountId = sel.value ? Number(sel.value) : null;
+              sel.addEventListener('change', () => { accountId = sel.value ? Number(sel.value) : null; });
+            }
+            okBtn.disabled = !scan.totals || Object.values(scan.totals).every(v => !v);
+          } catch (err) {
+            bodyEl.innerHTML = `<div class="empty" style="padding:18px 0"><div class="empty-icon">⚠️</div><h3>Scan failed</h3><p>${esc(err.message)}</p></div>`;
+            okBtn.disabled = true;
+          }
+        };
+
+        modal.querySelector('[data-rescan]').addEventListener('click', load);
+
+        okBtn.addEventListener('click', async () => {
+          if (!scan) return;
+          const pick = key => {
+            const el = bodyEl.querySelector(`[data-clean-${key}]`);
+            return !!(el && el.checked && !el.disabled);
+          };
+          const payload = {
+            delete_duplicates: pick('dup'),
+            delete_legacy: pick('legacy'),
+            delete_orphan_receipts: pick('orphan'),
+          };
+          if (pick('missing')) {
+            if (!accountId) return showToast('Pick an account for the unassigned transactions', 'error');
+            payload.assign_missing_account = accountId;
+          }
+          if (pick('recat') && scan.recategorize.suggestions.length) {
+            payload.recategorize = scan.recategorize.suggestions.map(s => ({ id: s.id, category_id: s.to_category_id }));
+          }
+          if (!payload.delete_duplicates && !payload.delete_legacy && !payload.delete_orphan_receipts &&
+              !payload.assign_missing_account && !payload.recategorize) {
+            return showToast('Select at least one cleanup action', 'error');
+          }
+
+          okBtn.disabled = true;
+          try {
+            const res = await api.post('/api/cleanup/apply', payload);
+            const a = res.applied || {};
+            const parts = [];
+            if (a.duplicates_deleted) parts.push(`${a.duplicates_deleted} duplicate${a.duplicates_deleted === 1 ? '' : 's'}`);
+            if (a.accounts_assigned) parts.push(`${a.accounts_assigned} assigned`);
+            if (a.recategorized) parts.push(`${a.recategorized} recategorized`);
+            if (a.legacy_deleted) parts.push(`${a.legacy_deleted} legacy row${a.legacy_deleted === 1 ? '' : 's'}`);
+            if (a.orphan_receipts_deleted) parts.push(`${a.orphan_receipts_deleted} orphan receipt${a.orphan_receipts_deleted === 1 ? '' : 's'}`);
+            showToast(parts.length ? `Cleanup applied: ${parts.join(', ')}` : 'Nothing needed changing');
+            closeModal(true);
+            if (onDone) onDone();
+          } catch (err) {
+            okBtn.disabled = false;
+            showToast(err.message, 'error');
+          }
+        });
+
+        await load();
+      },
+    }
+  );
+  return close;
+}
 
 function openCsvImportModal() {
   let csvText = '';

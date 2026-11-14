@@ -529,6 +529,85 @@ module.exports = function createSmart(ctx) {
 
   /* ---------------- analytics aggregates ---------------- */
 
+  /* ---------------- month-over-month comparison ---------------- */
+
+  /**
+   * Compares a month with the one before it. Returns totals, deltas and the
+   * biggest category moves so the Analytics screen can explain *why* spending
+   * changed, not just by how much.
+   */
+  async function compare(month) {
+    const previous = addMonthsKey(month, -1);
+    const cur = monthRange(month);
+    const prev = monthRange(previous);
+
+    const rows = await db.all(`
+      SELECT substr(date, 1, 7) AS ym, type, amount, category_id
+      FROM transactions WHERE date >= ? AND date <= ?`, [prev.start, cur.end]);
+    const cats = await catMap();
+
+    const totals = {
+      [month]: { income: 0, expense: 0, count: 0 },
+      [previous]: { income: 0, expense: 0, count: 0 },
+    };
+    const catTotals = { [month]: {}, [previous]: {} };
+
+    for (const r of rows) {
+      const t = totals[r.ym];
+      if (!t) continue;
+      t.count++;
+      t[r.type] += r.amount;
+      if (r.type === 'expense') {
+        catTotals[r.ym][r.category_id] = (catTotals[r.ym][r.category_id] || 0) + r.amount;
+      }
+    }
+
+    const metric = key => {
+      const a = totals[month][key];
+      const b = totals[previous][key];
+      return { current: a, previous: b, diff: a - b, pct: b > 0 ? ((a - b) / b) * 100 : null };
+    };
+    const net = t => t.income - t.expense;
+    const rate = t => (t.income > 0 ? ((t.income - t.expense) / t.income) * 100 : null);
+
+    const categoryIds = new Set([
+      ...Object.keys(catTotals[month]),
+      ...Object.keys(catTotals[previous]),
+    ]);
+    const categories = [...categoryIds].map(id => {
+      const c = cats[id] || { name: 'Unknown', icon: '📦', color: '#B2BEC3' };
+      const a = catTotals[month][id] || 0;
+      const b = catTotals[previous][id] || 0;
+      return {
+        id: Number(id), name: c.name, icon: c.icon, color: c.color,
+        current: a, previous: b, diff: a - b,
+        pct: b > 0 ? ((a - b) / b) * 100 : null,
+      };
+    }).sort((x, y) => Math.abs(y.diff) - Math.abs(x.diff));
+
+    return {
+      month,
+      previous,
+      hasPrevious: totals[previous].count > 0,
+      current: totals[month],
+      previousTotals: totals[previous],
+      expense: metric('expense'),
+      income: metric('income'),
+      net: {
+        current: net(totals[month]),
+        previous: net(totals[previous]),
+        diff: net(totals[month]) - net(totals[previous]),
+      },
+      savingsRate: {
+        current: rate(totals[month]),
+        previous: rate(totals[previous]),
+      },
+      categories: categories.slice(0, 8),
+    };
+  }
+
+  /* ---------------- analytics aggregates ---------------- */
+
   async function analytics(month) {
     const { start, end, days } = monthRange(month);
     const rows = await db.all(`
@@ -615,7 +694,7 @@ module.exports = function createSmart(ctx) {
   return {
     suggest, buildContext, suggestFromContext,
     insights, detectSubscriptions, budgetSuggestions,
-    weekdayForecast, weekdayAverages, streaks, analytics,
+    weekdayForecast, weekdayAverages, streaks, analytics, compare,
     invalidatePatterns,
   };
 };

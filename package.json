@@ -1,12 +1,13 @@
 {
   "name": "expense-tracker",
   "version": "1.0.0",
-  "description": "Full-stack expense tracker: income/expense tracking, budgets, recurring transactions, charts, multi-currency, dark mode, PWA.",
+  "description": "Full-stack expense tracker: income/expense tracking, accounts, receipts, charts, multi-currency, dark mode, PWA.",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
+    "test": "node tests/run.js",
     "dev:cf": "npx wrangler dev",
     "deploy": "npx wrangler deploy",
     "tunnel": "npx cloudflared tunnel --url http://localhost:3000",

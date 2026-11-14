@@ -82,6 +82,9 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 - **Bulk actions** — switch to Select mode, then delete, recategorize or
   add/remove tags on many transactions at once; deletes (single or bulk) show
   an **Undo** toast
+- **Receipt photos** — attach a photo to any transaction; images are
+  compressed in the browser, stored with the transaction, and included in
+  JSON backups. A 📎 marker shows which rows have one
 
 **Accounts & net worth**
 - Multiple accounts: **cash, bank, credit card, wallet, UPI, investment,
@@ -130,6 +133,8 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 - Payment-method breakdown
 - No-spend streak + best streak, active days
 - 6-month per-category trend grid
+- **Month-over-month comparison** — income, expenses, net and savings rate
+  versus the previous month, plus the categories that moved most
 
 **AI assistant** (optional, bring-your-own-key — see below)
 - **Ask** — chat with your real data: "how much did I spend on food this
@@ -157,8 +162,12 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 - AI assistant configuration (provider, key, model) with connection test
 - CSV export of transactions (includes account + tags)
 - Full JSON backup & restore (settings, accounts, categories, transfers,
-  transactions, tags) — v2 backups include accounts and transfers, and older
-  v1 backups still import
+  transactions, tags, receipts) — v2 backups include accounts and transfers,
+  and older v1 backups still import
+- **Data cleanup** — scan for exact duplicates, transactions with no account,
+  miscategorized rows, hidden legacy budget/recurring data and orphaned
+  receipts. The scan shows a full on-screen preview (counts and sample rows)
+  before anything is changed; applying re-validates the current data
 - One-click sample data for exploring
 - Danger zone to wipe all data (accounts and categories are kept)
 
@@ -173,6 +182,23 @@ tunnel; re-run `npm run tunnel` to get a fresh one.
 - Keyboard shortcuts: `N` new transaction, `/` search
 - Mobile bottom-sheet modals, desktop dialogs
 - SQLite with WAL mode, input validation everywhere
+
+---
+
+## Tests
+
+```bash
+npm test
+```
+
+This starts the app on a throwaway database (`DATA_DIR` in a temp folder), then
+runs five suites: the full API surface, mobile/desktop layout + liquid-nav
+animation, bulk actions/undo/gestures, category create/edit, and the app-lock
+flow. UI suites drive a real headless Chrome over the DevTools protocol, so
+set `CHROME_BIN` if Chrome is not in a standard location.
+
+CI runs the same command on every push and pull request
+(`.github/workflows/ci.yml`, Node 22 + Chrome).
 
 ---
 
@@ -199,6 +225,10 @@ public/
     views.js            Dashboard/transactions/accounts/analytics/settings
     app.js              Router, theme, keyboard shortcuts, init
 scripts/gen-icons.js    Regenerates PWA icons (npm run icons)
+tests/                  API + headless-Chrome UI suites (npm test)
+  run.js                Spawns a temp server and runs every suite
+  lib/cdp.js            Portable Chrome DevTools helper
+.github/workflows/ci.yml  CI: Node 22 + Chrome, runs npm test
 data/expenses.db        SQLite database (Node mode, created on first run)
 ```
 
@@ -209,6 +239,7 @@ data/expenses.db        SQLite database (Node mode, created on first run)
 | GET | `/api/bootstrap` | Settings, categories, accounts, currencies, AI status |
 | GET/PUT | `/api/settings` | Currency, theme, AI provider/key/model/base URL |
 | GET/POST/PUT/DELETE | `/api/transactions` | CRUD + filters/sort/search/tag/account/pagination |
+| PUT/GET/DELETE | `/api/transactions/:id/receipt` | Attach / fetch / remove a receipt photo |
 | GET/POST/PUT/DELETE | `/api/accounts` | Accounts with balances, opening balance, archive |
 | GET/POST/DELETE | `/api/transfers` | Move money between accounts |
 | POST | `/api/import/csv/preview` | Parse a bank CSV → headers + sample rows |
@@ -219,7 +250,10 @@ data/expenses.db        SQLite database (Node mode, created on first run)
 | GET | `/api/smart/insights` | Generated insights feed for a month |
 | POST | `/api/smart/suggest` | Category/method suggestion for a note |
 | GET | `/api/smart/subscriptions` | Detected near-regular charges |
+| GET | `/api/smart/compare?month=YYYY-MM` | Month-over-month income/expense/net comparison |
 | GET | `/api/analytics` | Heatmap/weekday/merchants/methods/streaks/trend |
+| GET | `/api/cleanup/scan` | Preview duplicates, missing accounts, recategorize suggestions, legacy data, orphan receipts |
+| POST | `/api/cleanup/apply` | Apply selected cleanup actions (re-validated) |
 | GET | `/api/ai/status` | AI configuration status + provider list |
 | POST | `/api/ai/ask` | Chat with your data (needs key) |
 | POST | `/api/ai/parse` | Sentence → prefilled transaction (needs key) |
@@ -376,6 +410,7 @@ you exported from your local instance (Settings → Full backup → Download JSO
   | Command | What it does |
   |---|---|
   | `npm start` / `npm run dev` | Run locally on Node.js (port 3000) |
+  | `npm test` | Run the API + headless-Chrome UI suites against a temp database |
   | `npm run dev:cf` | Run locally on Cloudflare's workerd runtime (port 8787) |
   | `npm run deploy` | Deploy to Cloudflare Workers + D1 |
   | `npm run tunnel` | Temporary public HTTPS URL for the local server |

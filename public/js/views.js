@@ -25,7 +25,7 @@ function txRowHTML(tx, { showDate = false, showMethod = true } = {}) {
       ${selecting ? `<input class="tx-check" type="checkbox" data-tx-check="${tx.id}" ${checked ? 'checked' : ''} aria-label="Select transaction">` : ''}
       <div class="tx-icon" style="background:${esc(tx.category_color)}22">${esc(tx.category_icon || '📦')}</div>
       <div class="tx-main">
-        <div class="tx-name">${esc(tx.note || tx.category_name)}</div>
+        <div class="tx-name">${esc(tx.note || tx.category_name)}${tx.has_receipt ? ' <span class="tx-receipt" title="Receipt attached" aria-label="Receipt attached">🧾</span>' : ''}</div>
         ${sub.length ? `<div class="tx-note">${sub.join(' · ')}</div>` : ''}
         ${tagChipsHTML(tx.tags)}
       </div>
@@ -850,6 +850,9 @@ async function renderAnalytics() {
     return;
   }
 
+  let cmp = null;
+  try { cmp = await api.get('/api/smart/compare' + api.qs({ month: State.month })); } catch { /* optional card */ }
+
   if (!a.activeDays) {
     view.innerHTML = `
       <div class="card month-nav">${monthNavHTML()}</div>
@@ -864,6 +867,60 @@ async function renderAnalytics() {
 
   const st = a.streaks;
   const monthTotalExpense = a.expense;
+
+  const compareHTML = (() => {
+    if (!cmp) return '';
+    const signed = v => (v > 0 ? '+' : v < 0 ? '−' : '') + fmtMoney(Math.abs(v));
+    const deltaText = (m, invert) => {
+      if (!m) return '';
+      if (m.previous <= 0) return m.current > 0 ? '<span class="compare-delta flat">new this month</span>' : '';
+      const p = Math.round(m.pct);
+      const cls = m.diff === 0 ? 'flat' : (invert ? m.diff < 0 : m.diff > 0) ? 'up' : 'down';
+      return `<span class="compare-delta ${cls}">${m.diff > 0 ? '↑' : m.diff < 0 ? '↓' : '→'} ${Math.abs(p)}%</span>`;
+    };
+    const metric = (label, value, delta) => `
+      <div class="compare-metric">
+        <div class="compare-label">${label}</div>
+        <div class="compare-value">${esc(fmtMoney(value, { compact: true }))}</div>
+        ${delta}
+      </div>`;
+
+    const netDelta = cmp.net.diff;
+    const netCls = netDelta === 0 ? 'flat' : netDelta > 0 ? 'down' : 'up';
+    const cats = (cmp.categories || []).filter(c => c.diff !== 0).slice(0, 5);
+    const catsHTML = cats.length ? `
+      <div class="compare-cats">
+        ${cats.map(c => {
+          const cls = c.diff > 0 ? 'up' : 'down';
+          return `
+            <div class="compare-cat">
+              <span class="compare-cat-icon" style="background:${esc(c.color)}22">${esc(c.icon || '📦')}</span>
+              <div class="compare-cat-main">
+                <div class="compare-cat-name">${esc(c.name)}</div>
+                <div class="compare-cat-sub">${esc(fmtMoney(c.previous, { compact: true }))} → ${esc(fmtMoney(c.current, { compact: true }))}</div>
+              </div>
+              <span class="compare-cat-delta ${cls}">${signed(c.diff)}</span>
+            </div>`;
+        }).join('')}
+      </div>` : '<div class="help-text" style="margin:10px 0 0">No category changes worth calling out.</div>';
+
+    return `
+      <div class="card">
+        <div class="card-title">↔️ Month over month <span class="chip">vs ${esc(monthLabel(cmp.previous))}</span></div>
+        ${!cmp.hasPrevious ? `<div class="help-text" style="margin:0 0 10px">No transactions in ${esc(monthLabel(cmp.previous))} yet — this is your first month of data.</div>` : ''}
+        <div class="compare-grid">
+          ${metric('Spending', cmp.expense.current, deltaText(cmp.expense, true))}
+          ${metric('Income', cmp.income.current, deltaText(cmp.income, false))}
+          <div class="compare-metric">
+            <div class="compare-label">Saved</div>
+            <div class="compare-value">${esc(fmtMoney(cmp.net.current, { compact: true }))}</div>
+            <span class="compare-delta ${netCls}">${signed(netDelta)} vs last month</span>
+          </div>
+        </div>
+        ${cats.length ? `<div class="card-title" style="margin:16px 0 0;font-size:13px">Biggest category moves</div>` : ''}
+        ${catsHTML}
+      </div>`;
+  })();
 
   // merchants leaderboard
   const maxMerch = Math.max(...a.merchants.map(m => m.total), 1);
@@ -915,6 +972,8 @@ async function renderAnalytics() {
 
   view.innerHTML = `
     <div class="card month-nav">${monthNavHTML()}</div>
+
+    ${compareHTML}
 
     <div class="stats-grid">
       <div class="stat">
@@ -1276,6 +1335,15 @@ async function renderSettings() {
     </div>
 
     <div class="card">
+      <div class="card-title">🧹 Data cleanup</div>
+      <p style="color:var(--text-2);font-size:14px;margin:0 0 10px">
+        Find duplicate transactions, rows with no account, miscategorized entries, hidden legacy data and orphaned receipts.
+        You will see exactly what will change before anything is applied.
+      </p>
+      <button class="btn secondary" id="btnCleanup">Scan for cleanup</button>
+    </div>
+
+    <div class="card">
       <div class="card-title">Use on your phone</div>
       <p style="color:var(--text-2);font-size:14px;margin:0 0 10px">
         ${isLocal
@@ -1384,6 +1452,7 @@ async function renderSettings() {
   $('#btnSample').addEventListener('click', () => loadSampleData());
   $('#btnCsvImport').addEventListener('click', () => openCsvImportModal());
   $('#fileImport').addEventListener('change', importBackup);
+  $('#btnCleanup').addEventListener('click', () => openCleanupModal(() => refreshView()));
   $$('[data-goto]').forEach(b => b.addEventListener('click', () => { location.hash = '#/' + b.dataset.goto; }));
   $('#btnWipe').addEventListener('click', async () => {
     const ok = await confirmDialog({

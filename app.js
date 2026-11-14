@@ -64,6 +64,12 @@ const ACCOUNT_TYPES = [
 ];
 const ACCOUNT_TYPE_MAP = Object.fromEntries(ACCOUNT_TYPES.map(t => [t.id, t]));
 
+/* Receipt photos are stored as base64 in the database so backups stay
+   self-contained and both runtimes (Node SQLite / Cloudflare D1) work
+   without object storage. The client compresses images before upload. */
+const RECEIPT_MIMES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+const MAX_RECEIPT_CHARS = 1300000; // ~975 KB of binary — comfortably under D1's row limit
+
 const DEFAULT_ACCOUNTS = [
   { name: 'Cash', type: 'cash', icon: '💵', color: '#00B894' },
   { name: 'Bank Account', type: 'bank', icon: '🏦', color: '#0984E3' },
@@ -164,6 +170,27 @@ CREATE TABLE IF NOT EXISTS budgets (
   category_id INTEGER NOT NULL UNIQUE REFERENCES categories(id) ON DELETE CASCADE,
   amount      REAL NOT NULL CHECK (amount > 0)
 );
+CREATE TABLE IF NOT EXISTS receipts (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  transaction_id INTEGER NOT NULL UNIQUE REFERENCES transactions(id) ON DELETE CASCADE,
+  mime           TEXT    NOT NULL,
+  data           TEXT    NOT NULL,
+  size           INTEGER NOT NULL DEFAULT 0,
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+`;
+
+/* Created separately so databases that already passed schema_v2 get the table. */
+const RECEIPTS_SCHEMA_SQL = `
+CREATE TABLE IF NOT EXISTS receipts (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  transaction_id INTEGER NOT NULL UNIQUE REFERENCES transactions(id) ON DELETE CASCADE,
+  mime           TEXT    NOT NULL,
+  data           TEXT    NOT NULL,
+  size           INTEGER NOT NULL DEFAULT 0,
+  created_at     TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+CREATE INDEX IF NOT EXISTS idx_receipts_tx ON receipts(transaction_id);
 `;
 
 /* ------------------------------------------------------------------ */
@@ -437,9 +464,16 @@ async function ensureSchema(db) {
   try {
     marker = await db.get("SELECT value FROM settings WHERE key = 'schema_v2'");
   } catch { /* no schema yet */ }
-  if (marker && marker.value === 'ok') return;
+  if (marker && marker.value === 'ok') {
+    // Additive migrations for databases that were initialized before this
+    // feature existed. Everything below is IF NOT EXISTS, so it is safe to run
+    // on every boot.
+    await db.exec(RECEIPTS_SCHEMA_SQL);
+    return;
+  }
 
   await db.exec(SCHEMA_SQL);
+  await db.exec(RECEIPTS_SCHEMA_SQL);
   // databases from before the tags feature (tags is in SCHEMA_SQL for new ones)
   try { await db.exec("ALTER TABLE transactions ADD COLUMN tags TEXT NOT NULL DEFAULT ''"); }
   catch (err) { if (!/duplicate column/i.test(String(err && err.message))) throw err; }
@@ -511,7 +545,8 @@ function createApp(db, opts = {}) {
   async function txRow(id) {
     return db.get(`
       SELECT t.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color,
-             a.name AS account_name, a.icon AS account_icon, a.color AS account_color, a.type AS account_type
+             a.name AS account_name, a.icon AS account_icon, a.color AS account_color, a.type AS account_type,
+             EXISTS(SELECT 1 FROM receipts r WHERE r.transaction_id = t.id) AS has_receipt
       FROM transactions t
       JOIN categories c ON c.id = t.category_id
       LEFT JOIN accounts a ON a.id = t.account_id
@@ -794,7 +829,8 @@ function createApp(db, opts = {}) {
 
     const rows = await db.all(`
       SELECT t.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color,
-             a.name AS account_name, a.icon AS account_icon, a.color AS account_color, a.type AS account_type
+             a.name AS account_name, a.icon AS account_icon, a.color AS account_color, a.type AS account_type,
+             EXISTS(SELECT 1 FROM receipts r WHERE r.transaction_id = t.id) AS has_receipt
       ${joins}
       ${whereSql} ORDER BY ${sortSql} LIMIT ? OFFSET ?`, [...params, lim, off]);
 
@@ -902,9 +938,65 @@ function createApp(db, opts = {}) {
     const id = Number(c.req.param('id'));
     const row = await db.get('SELECT * FROM transactions WHERE id = ?', [id]);
     if (!row) return c.json({ error: 'Transaction not found' }, 404);
-    await db.run('DELETE FROM transactions WHERE id = ?', [id]);
+    await db.batch([
+      { sql: 'DELETE FROM receipts WHERE transaction_id = ?', params: [id] },
+      { sql: 'DELETE FROM transactions WHERE id = ?', params: [id] },
+    ]);
     SmartEngine.invalidatePatterns();
     return c.json({ ok: true, row });
+  });
+
+  /* ---- receipt photos (base64 in the DB, one per transaction) ---- */
+
+  function parseReceipt(body) {
+    const b = body || {};
+    const mime = String(b.mime || '').toLowerCase().split(';')[0].trim();
+    if (!RECEIPT_MIMES.includes(mime)) {
+      return { error: 'Unsupported image type (use JPEG, PNG, WebP or GIF)' };
+    }
+    let data = typeof b.data === 'string' ? b.data.trim() : '';
+    // Tolerate a full data URL; only the base64 payload is stored.
+    const comma = data.indexOf(',');
+    if (/^data:/i.test(data) && comma > 0) data = data.slice(comma + 1);
+    data = data.replace(/\s+/g, '');
+    if (!data) return { error: 'No image data' };
+    if (data.length > MAX_RECEIPT_CHARS) return { error: 'Image is too large. Try a smaller photo.' };
+    if (data.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(data)) {
+      return { error: 'Invalid image data' };
+    }
+    const padding = data.endsWith('==') ? 2 : data.endsWith('=') ? 1 : 0;
+    return { mime, data, size: (data.length * 3) / 4 - padding };
+  }
+
+  app.put('/api/transactions/:id/receipt', async (c) => {
+    const id = Number(c.req.param('id'));
+    if (!Number.isInteger(id) || id <= 0) return c.json({ error: 'Invalid transaction id' }, 400);
+    const tx = await db.get('SELECT id FROM transactions WHERE id = ?', [id]);
+    if (!tx) return c.json({ error: 'Transaction not found' }, 404);
+    const p = parseReceipt(await readJson(c));
+    if (p.error) return c.json({ error: p.error }, 400);
+    await db.run(`
+      INSERT INTO receipts (transaction_id, mime, data, size) VALUES (?, ?, ?, ?)
+      ON CONFLICT(transaction_id) DO UPDATE SET
+        mime = excluded.mime, data = excluded.data, size = excluded.size,
+        created_at = datetime('now')`,
+      [id, p.mime, p.data, p.size]);
+    return c.json({ ok: true, has_receipt: true, mime: p.mime, size: p.size });
+  });
+
+  app.get('/api/transactions/:id/receipt', async (c) => {
+    const id = Number(c.req.param('id'));
+    const row = await db.get(
+      'SELECT mime, data, size, created_at FROM receipts WHERE transaction_id = ?', [id]);
+    if (!row) return c.json({ error: 'No receipt for this transaction' }, 404);
+    return c.json(row);
+  });
+
+  app.delete('/api/transactions/:id/receipt', async (c) => {
+    const id = Number(c.req.param('id'));
+    const info = await db.run('DELETE FROM receipts WHERE transaction_id = ?', [id]);
+    if (!info.changes) return c.json({ error: 'No receipt for this transaction' }, 404);
+    return c.json({ ok: true, has_receipt: false });
   });
 
   /* Bulk select actions: delete (returns rows for undo), restore, and
@@ -931,10 +1023,13 @@ function createApp(db, opts = {}) {
       if (!ids.length) return c.json({ error: 'No transactions selected' }, 400);
       const rows = await fetchRows();
       if (rows.length) {
-        await db.batch(chunkArray(ids, 90).map(chunk => ({
-          sql: `DELETE FROM transactions WHERE id IN (${chunk.map(() => '?').join(',')})`,
-          params: chunk,
-        })));
+        const stmts = [];
+        for (const chunk of chunkArray(ids, 90)) {
+          const marks = chunk.map(() => '?').join(',');
+          stmts.push({ sql: `DELETE FROM receipts WHERE transaction_id IN (${marks})`, params: chunk });
+          stmts.push({ sql: `DELETE FROM transactions WHERE id IN (${marks})`, params: chunk });
+        }
+        await db.batch(stmts);
       }
       SmartEngine.invalidatePatterns();
       return c.json({ deleted: rows.length, rows });
@@ -1389,7 +1484,8 @@ function createApp(db, opts = {}) {
 
     const recent = await db.all(`
       SELECT t.*, c.name AS category_name, c.icon AS category_icon, c.color AS category_color,
-             a.name AS account_name, a.icon AS account_icon, a.color AS account_color
+             a.name AS account_name, a.icon AS account_icon, a.color AS account_color,
+             EXISTS(SELECT 1 FROM receipts r WHERE r.transaction_id = t.id) AS has_receipt
       FROM transactions t
       JOIN categories c ON c.id = t.category_id
       LEFT JOIN accounts a ON a.id = t.account_id
@@ -1430,6 +1526,11 @@ function createApp(db, opts = {}) {
   });
 
   app.get('/api/smart/subscriptions', async (c) => c.json(await SmartEngine.detectSubscriptions()));
+
+  app.get('/api/smart/compare', async (c) => {
+    const month = validMonthKeyOrCurrent(c.req.query('month'));
+    return c.json(await SmartEngine.compare(month));
+  });
 
   app.get('/api/smart/budget-suggestions', async (c) => {
     const month = validMonthKeyOrCurrent(c.req.query('month'));
@@ -1476,6 +1577,205 @@ function createApp(db, opts = {}) {
     }
   });
 
+  /* ---- cleanup tools: scan (preview) + apply (re-validated) ---- */
+
+  async function cleanupScan() {
+    // Exact duplicates: same date/type/amount/category/account/note.
+    const dupRowLimit = 400;
+    const dupRows = await db.all(`
+      SELECT * FROM (
+        SELECT t.id, t.date, t.type, t.amount, t.category_id, t.account_id, t.note, t.method,
+               c.name AS category_name, c.icon AS category_icon,
+               COUNT(*) OVER (
+                 PARTITION BY t.date, t.type, t.amount, t.category_id, COALESCE(t.account_id, 0), t.note
+               ) AS dup_count,
+               ROW_NUMBER() OVER (
+                 PARTITION BY t.date, t.type, t.amount, t.category_id, COALESCE(t.account_id, 0), t.note
+                 ORDER BY t.id
+               ) AS rn
+        FROM transactions t JOIN categories c ON c.id = t.category_id
+      ) WHERE dup_count > 1
+      ORDER BY date DESC, id DESC LIMIT ?`, [dupRowLimit]);
+
+    const groupsByKey = new Map();
+    for (const r of dupRows) {
+      const key = `${r.date}|${r.type}|${r.amount}|${r.category_id}|${r.account_id ?? 0}|${r.note}`;
+      let g = groupsByKey.get(key);
+      if (!g) { g = { key, keep_id: r.id, ids: [], rows: [] }; groupsByKey.set(key, g); }
+      g.keep_id = Math.min(g.keep_id, r.id);
+      g.ids.push(r.id);
+      if (g.rows.length < 4) g.rows.push(r);
+    }
+    const dupGroups = [...groupsByKey.values()].sort((a, b) => b.ids.length - a.ids.length);
+    const dupStats = await db.get(`
+      SELECT COALESCE(SUM(n - 1), 0) AS delete_rows, COUNT(*) AS groups FROM (
+        SELECT COUNT(*) AS n FROM transactions
+        GROUP BY date, type, amount, category_id, COALESCE(account_id, 0), note
+        HAVING COUNT(*) > 1
+      )`);
+
+    // Transactions with no account linked.
+    const missingCount = (await db.get('SELECT COUNT(*) AS c FROM transactions WHERE account_id IS NULL')).c;
+    const missingRows = await db.all(`
+      SELECT t.id, t.date, t.type, t.amount, t.note, c.name AS category_name, c.icon AS category_icon
+      FROM transactions t JOIN categories c ON c.id = t.category_id
+      WHERE t.account_id IS NULL ORDER BY t.date DESC, t.id DESC LIMIT 10`);
+
+    // Smart recategorization suggestions. Scan recent rows only and require a
+    // confident match (or a generic fallback category) to avoid noisy advice.
+    const scanRows = await db.all(`
+      SELECT t.id, t.date, t.type, t.amount, t.note, t.category_id,
+             c.name AS category_name, c.icon AS category_icon
+      FROM transactions t JOIN categories c ON c.id = t.category_id
+      ORDER BY t.date DESC, t.id DESC LIMIT 2000`);
+    const smartCtx = await SmartEngine.buildContext();
+    const cats = await db.all('SELECT id, name, type, icon, color FROM categories');
+    const catById = new Map(cats.map(c => [c.id, c]));
+    const suggestions = [];
+    for (const r of scanRows) {
+      const s = SmartEngine.suggestFromContext(smartCtx, { type: r.type, note: r.note, amount: r.amount });
+      if (!s || !s.category_id || s.category_id === r.category_id) continue;
+      const to = catById.get(s.category_id);
+      if (!to || to.type !== r.type) continue;
+      const generic = r.category_name === 'Others' || r.category_name === 'Other Income';
+      if (!generic && (s.confidence || 0) < 0.6) continue;
+      suggestions.push({
+        id: r.id, date: r.date, type: r.type, amount: r.amount, note: r.note,
+        from_category: r.category_name, from_icon: r.category_icon,
+        to_category_id: to.id, to_category: to.name, to_icon: to.icon, to_color: to.color,
+        confidence: Math.round((s.confidence || 0) * 100), source: s.source,
+      });
+    }
+
+    // Hidden legacy data (budgets / recurring rules are no longer in the UI).
+    const budgets = await db.get('SELECT COUNT(*) AS c FROM budgets');
+    const recurring = await db.get('SELECT COUNT(*) AS c FROM recurring');
+    const budgetRows = await db.all(`
+      SELECT b.id, b.amount, c.name AS category FROM budgets b
+      JOIN categories c ON c.id = b.category_id ORDER BY b.id LIMIT 5`);
+    const recurringRows = await db.all(`
+      SELECT id, type, amount, note, frequency, next_date, active
+      FROM recurring ORDER BY id LIMIT 5`);
+
+    // Receipts whose transaction disappeared (e.g. an older import).
+    const orphanReceipts = await db.all(`
+      SELECT r.transaction_id, r.mime, r.size, r.created_at
+      FROM receipts r LEFT JOIN transactions t ON t.id = r.transaction_id
+      WHERE t.id IS NULL ORDER BY r.id`);
+
+    return {
+      generated_at: new Date().toISOString(),
+      duplicates: {
+        groups: dupGroups.slice(0, 50),
+        group_count: dupStats.groups || 0,
+        delete_count: dupStats.delete_rows || 0,
+        truncated: dupGroups.length > 50 || dupRows.length >= dupRowLimit,
+      },
+      missing_account: { count: missingCount, rows: missingRows },
+      recategorize: { suggestions: suggestions.slice(0, 100), total: suggestions.length, scanned: scanRows.length },
+      legacy: {
+        budgets: budgets.c, recurring: recurring.c,
+        budget_rows: budgetRows, recurring_rows: recurringRows,
+      },
+      orphan_receipts: { count: orphanReceipts.length, rows: orphanReceipts },
+      totals: {
+        duplicate_rows: dupStats.delete_rows || 0,
+        missing_account: missingCount,
+        recategorize: suggestions.length,
+        legacy: budgets.c + recurring.c,
+        orphan_receipts: orphanReceipts.length,
+      },
+    };
+  }
+
+  app.get('/api/cleanup/scan', async (c) => c.json(await cleanupScan()));
+
+  app.post('/api/cleanup/apply', async (c) => {
+    const body = await readJson(c);
+    const applied = {};
+    let touched = false;
+
+    if (body.delete_duplicates) {
+      // Re-scan so the action is based on current data, never the old preview.
+      const dupRows = await db.all(`
+        SELECT id FROM (
+          SELECT t.id,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY t.date, t.type, t.amount, t.category_id, COALESCE(t.account_id, 0), t.note
+                   ORDER BY t.id
+                 ) AS rn
+          FROM transactions t
+        ) WHERE rn > 1 LIMIT 5000`);
+      const ids = dupRows.map(r => r.id);
+      if (ids.length) {
+        const stmts = [];
+        for (const chunk of chunkArray(ids, 90)) {
+          const marks = chunk.map(() => '?').join(',');
+          stmts.push({ sql: `DELETE FROM receipts WHERE transaction_id IN (${marks})`, params: chunk });
+          stmts.push({ sql: `DELETE FROM transactions WHERE id IN (${marks})`, params: chunk });
+        }
+        await db.batch(stmts);
+        touched = true;
+      }
+      applied.duplicates_deleted = ids.length;
+    }
+
+    if (body.assign_missing_account !== undefined && body.assign_missing_account !== null &&
+        body.assign_missing_account !== '' && body.assign_missing_account !== 0) {
+      const account = await getAccount(Number(body.assign_missing_account));
+      if (!account) return c.json({ error: 'Account not found' }, 400);
+      const info = await db.run(
+        'UPDATE transactions SET account_id = ?, method = ? WHERE account_id IS NULL',
+        [account.id, accountMethod(account)]);
+      applied.accounts_assigned = info.changes || 0;
+      if (info.changes) touched = true;
+    }
+
+    if (Array.isArray(body.recategorize) && body.recategorize.length) {
+      const wanted = body.recategorize
+        .map(x => ({ id: Number(x && x.id), category_id: Number(x && x.category_id) }))
+        .filter(x => Number.isInteger(x.id) && x.id > 0 && Number.isInteger(x.category_id) && x.category_id > 0)
+        .slice(0, 500);
+      const ids = [...new Set(wanted.map(x => x.id))];
+      const rows = [];
+      for (const chunk of chunkArray(ids, 90)) {
+        rows.push(...await db.all(
+          `SELECT id, type FROM transactions WHERE id IN (${chunk.map(() => '?').join(',')})`, chunk));
+      }
+      const typeById = new Map(rows.map(r => [r.id, r.type]));
+      const catCache = new Map();
+      const stmts = [];
+      for (const w of wanted) {
+        const type = typeById.get(w.id);
+        if (!type) continue;
+        if (!catCache.has(w.category_id)) catCache.set(w.category_id, await getCategory(w.category_id));
+        const cat = catCache.get(w.category_id);
+        if (!cat || cat.type !== type) continue;
+        stmts.push({ sql: 'UPDATE transactions SET category_id = ? WHERE id = ?', params: [cat.id, w.id] });
+      }
+      if (stmts.length) { await db.batch(stmts); touched = true; }
+      applied.recategorized = stmts.length;
+    }
+
+    if (body.delete_legacy) {
+      const b = await db.get('SELECT COUNT(*) AS c FROM budgets');
+      const r = await db.get('SELECT COUNT(*) AS c FROM recurring');
+      await db.batch([{ sql: 'DELETE FROM budgets' }, { sql: 'DELETE FROM recurring' }]);
+      applied.legacy_deleted = (b.c || 0) + (r.c || 0);
+      if (applied.legacy_deleted) touched = true;
+    }
+
+    if (body.delete_orphan_receipts) {
+      const info = await db.run(
+        'DELETE FROM receipts WHERE transaction_id NOT IN (SELECT id FROM transactions)');
+      applied.orphan_receipts_deleted = info.changes || 0;
+      if (info.changes) touched = true;
+    }
+
+    if (touched) SmartEngine.invalidatePatterns();
+    return c.json({ ok: true, applied });
+  });
+
   /* ---- export / import / maintenance ---- */
   async function exportJson() {
     return {
@@ -1489,6 +1789,7 @@ function createApp(db, opts = {}) {
       transfers: await db.all('SELECT * FROM transfers ORDER BY id'),
       budgets: await db.all('SELECT * FROM budgets ORDER BY id'),
       recurring: await db.all('SELECT * FROM recurring ORDER BY id'),
+      receipts: await db.all('SELECT * FROM receipts ORDER BY id'),
     };
   }
 
@@ -1538,6 +1839,7 @@ function createApp(db, opts = {}) {
 
     try {
       const stmts = [
+        { sql: 'DELETE FROM receipts' },
         { sql: 'DELETE FROM transfers' },
         { sql: 'DELETE FROM transactions' },
         { sql: 'DELETE FROM budgets' },
@@ -1614,8 +1916,20 @@ function createApp(db, opts = {}) {
           }
         }
       }
+      // Receipts ride along with their transactions (same ids in the backup).
+      if (Array.isArray(data.receipts)) {
+        const txIds = new Set(data.transactions.map(t => Number(t.id)));
+        for (const r of data.receipts) {
+          const p = parseReceipt(r);
+          if (p.error || !txIds.has(Number(r.transaction_id))) continue;
+          stmts.push({
+            sql: 'INSERT INTO receipts (transaction_id, mime, data, size) VALUES (?, ?, ?, ?)',
+            params: [Number(r.transaction_id), p.mime, p.data, p.size],
+          });
+        }
+      }
       await db.batch(stmts);
-      try { await db.exec("DELETE FROM sqlite_sequence WHERE name IN ('accounts','categories','transactions','transfers','budgets','recurring')"); } catch { /* not available everywhere */ }
+      try { await db.exec("DELETE FROM sqlite_sequence WHERE name IN ('accounts','categories','transactions','transfers','budgets','recurring','receipts')"); } catch { /* not available everywhere */ }
       SmartEngine.invalidatePatterns();
     } catch (err) {
       return c.json({ error: 'Import failed: ' + err.message }, 400);
@@ -1904,6 +2218,7 @@ function createApp(db, opts = {}) {
   app.delete('/api/data', async (c) => {
     if (c.req.query('confirm') !== 'DELETE') return c.json({ error: 'Pass ?confirm=DELETE to confirm' }, 400);
     await db.batch([
+      { sql: 'DELETE FROM receipts' },
       { sql: 'DELETE FROM transfers' },
       { sql: 'DELETE FROM transactions' },
       { sql: 'DELETE FROM budgets' },

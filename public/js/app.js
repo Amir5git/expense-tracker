@@ -171,6 +171,7 @@ function animateView(view) {
 /* ---------- liquid bottom navigation ---------- */
 
 let navResizeRaf = 0;
+let navStretchTimer = 0;
 
 function setupBottomNav() {
   const nav = $('#bottomnav');
@@ -206,10 +207,28 @@ function positionNavLiquid({ instant = false } = {}) {
   const navRect = nav.getBoundingClientRect();
   const center = rect.left - navRect.left + rect.width / 2;
   const width = Math.max(52, rect.width - 10);
+  const fromX = parseFloat(liquid.style.getPropertyValue('--nav-x'));
+  const distance = Number.isFinite(fromX) ? Math.abs(center - fromX) : 0;
+  const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 
   if (instant) liquid.classList.add('no-anim');
   liquid.style.setProperty('--nav-x', `${center}px`);
   liquid.style.setProperty('--nav-w', `${width}px`);
+
+  // Stretch in the direction of travel, then settle back like a liquid.
+  if (!instant && !reduced && distance > 2) {
+    liquid.style.setProperty('--nav-stretch', Math.min(1.16, 1 + distance / 1100).toFixed(3));
+    liquid.style.setProperty('--nav-trail-stretch', Math.min(1.42, 1 + distance / 420).toFixed(3));
+    clearTimeout(navStretchTimer);
+    navStretchTimer = setTimeout(() => {
+      liquid.style.setProperty('--nav-stretch', '1');
+      liquid.style.setProperty('--nav-trail-stretch', '1');
+    }, 300);
+  } else if (instant) {
+    liquid.style.setProperty('--nav-stretch', '1');
+    liquid.style.setProperty('--nav-trail-stretch', '1');
+  }
+
   if (instant) {
     void liquid.offsetWidth;
     requestAnimationFrame(() => liquid.classList.remove('no-anim'));
